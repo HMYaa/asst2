@@ -44,7 +44,28 @@ Lab 2 Part A Step 3（ThreadPoolSleeping）是得分最高、也最难正确实�
 
 **机制**
 
-**Test-and-Set（TAS）实现的自旋锁：**
+> **一句话记忆法**
+> 
+> **TAS** = "直接抢，不管之前是啥" → `exchange(true)` 强制设为 true，看返回值  
+> **CAS** = "先比较，符合条件才换" → `compare_exchange(expected, new)` 判断后交换
+
+**记忆口诀：抢锁 vs 换锁**
+
+```
+TAS（Test-and-Set）= 霸道总裁式抢锁：
+  "不管之前是谁的，我现在要设为 true，告诉我之前是不是 false"
+  → exchange(old, new)：直接换，返回旧值
+  → 如果旧值是 false → 我抢到了！
+  → 如果旧值是 true  → 别人占着，我继续抢
+  
+CAS（Compare-and-Swap）= 条件交换式换锁：
+  "只有当锁还是 expected 值时，我才换成 new"
+  → compare_exchange(expected, new)：先比较再换
+  → 符合预期 → 交换成功，返回 true
+  → 不符合 → 失败，把 actual 值写回 expected
+```
+
+**Test-and-Set（TAS）——霸道抢锁：**
 
 ```cpp
 class SpinLock {
@@ -63,7 +84,7 @@ public:
 };
 ```
 
-**Compare-and-Swap（CAS）实现更通用：**
+**Compare-and-Swap（CAS）——条件换锁（更通用）：**
 
 ```cpp
 void lock() {
@@ -72,6 +93,23 @@ void lock() {
         expected = false;  // CAS 失败时 expected 被修改，需要重置
     }
 }
+```
+
+**使用场景区别速查**
+
+| 特性 | TAS (exchange) | CAS (compare_exchange) |
+|:---|:---|:---|
+| **语义** | 无条件交换，返回旧值 | 条件交换，比较后才换 |
+| **适用** | 简单的锁获取/自旋 | ABA 问题处理、无锁数据结构 |
+| **返回值** | 旧值（成功/失败看旧值）| true/false（成功否） |
+| **失败时** | 无（总会成功）| expected 被更新为实际值 |
+
+```
+记忆锚点：
+  CAS 的 C = Compare（先比较）
+  CAS 的 S = Swap（再交换）
+  
+  TAS 没有 Compare，直接 Set（Test 其实是返回旧值让你判断）
 ```
 
 **std::mutex 的实际实现（简化版）：**
@@ -113,108 +151,136 @@ Sleeping 版中 lock/unlock 的开销：
 
 **定义**
 
-条件变量（Condition Variable）是一种允许线程等待某个条件成立的同步原语。`wait(lock)` 操作原子地释放关联的互斥锁并将线程挂起到等待队列中；被 `notify_one()` 或 `notify_all()` 唤醒后，自动重新获取锁。这种"释放锁 + 挂起"的原子性保证了不会丢失在释放锁和挂起之间发生的通知（lost wakeup）。
+一句话：**条件变量 = "睡等通知"机制——线程先释放锁去睡觉，被唤醒后再拿锁继续执行。核心 trick 是"放锁+睡觉"这两步必须是原子的，否则通知会在间隙里丢失。**
 
 **直觉**
 
+> **一句话记忆法**
+> 
+> **条件变量 = 快递员打电话模型**：告诉快递员"到了 call 我"，挂电话+睡觉必须一口气完成，否则快递来了你还没睡下，电话响了没接到 → 永远睡下去（死锁）。
+
 ```
-条件变量解决的问题：
+没有条件变量 = 反复查快递（自旋）：
+  while (快递没到) {
+      开门看 → 没有 → 关门  // 累死人，浪费电（CPU）
+  }
 
-  你想等一个包裹到达。没有条件变量时：
-    while (包裹没到) {
-        开门看看 → 没有 → 关门
-        开门看看 → 没有 → 关门
-        开门看看 → 没有 → 关门
-        ...（反复开关门，累死）
-    }
-
-  有条件变量时：
-    告诉快递员"到了给我打电话"
-    挂掉电话 → 睡觉
-    电话响了 → 起床 → 开门取包裹
-
-  "挂掉电话 + 睡觉"必须是原子的！
-  如果你先挂电话、再准备睡觉，快递员可能在这个间隙打来
-  你错过了电话（lost wakeup），然后永远睡下去...
+有条件变量 = 等电话（睡眠）：
+  ① 给快递员留言："到了 call 我"   // predicate 告诉系统什么条件唤醒我
+  ② 挂电话 + 立刻睡觉（原子！）      // unlock + sleep 原子化，防止 missed call
+  ③ 电话响了 → 醒了 → 拿钥匙开门   // 被 notify → 重新 lock → 取快递
+  
+关键：步骤 ② "挂电话+睡觉"必须是原子的！
+  ❌ 错误：先挂电话 → （快递员此时 call）→ 准备睡觉 → 错过 call → 永远睡下去
+  ✅ 正确："挂电话并同时进入睡眠模式"是一步完成的
 ```
 
-**机制**
+**机制三步曲**
 
-`condition_variable::wait(lock, predicate)` 的内部实现（伪代码）：
+```mermaid
+flowchart TB
+    subgraph Step1["① 检查条件（持锁）"]
+        A1["lock()"]
+        A2["while (!pred)"]
+        A3["条件为 true?"]
+    end
+    
+    subgraph Step2["② 原子放锁+睡觉"]
+        B1["unlock()"]
+        B2["sleep()"]
+        B1 --- |"原子操作<br/>不可分割"| B2
+    end
+    
+    subgraph Step3["③ 被唤醒后（持锁返回）"]
+        C1["被 notify 唤醒"]
+        C2["lock()"]
+        C3["返回，pred 为 true"]
+    end
+    
+    A1 --> A2 --> A3
+    A3 -->|"false"| Step2
+    Step2 --> Step3
+    A3 -->|"true<br/>直接返回"| C3
+    
+    style Step1 fill:#e8f5e9,stroke:#2e7d32
+    style Step2 fill:#fff3e0,stroke:#ef6c00,stroke-width:3px
+    style Step3 fill:#e3f2fd,stroke:#1565c0
+```
+
+**代码实现（伪代码）**
 
 ```cpp
 void wait(unique_lock<mutex>& lk, function<bool()> pred) {
-    while (!pred()) {           // ① 检查条件（持锁状态下）
-        // 原子地执行以下两步：
-        lk.unlock();            // ② 释放锁
-        enqueue_self_and_sleep(); // ③ 加入等待队列并挂起
-        // --- 线程在此处睡眠 ---
-        // 被 notify 唤醒后：
-        lk.lock();              // ④ 重新获取锁
-        // 回到 while 循环顶部，重新检查 pred()
-    }
-    // pred() 为 true 且持有锁 → 返回
+    while (!pred()) {              // ① 检查条件（必须持锁）
+        // === 原子分割线 ===
+        lk.unlock();                // ②a 放钥匙（释放锁）
+        enqueue_and_sleep();         // ②b 去睡觉（挂起线程）
+        // === 原子分割线 ===
+        lk.lock();                   // ③ 醒来先拿钥匙（重新锁）
+    }  // ④ 检查 pred，false 则继续睡，true 则持锁返回
 }
 ```
 
-**为什么必须持锁调用 wait？**
+**为什么必须持锁调用 wait？——防止 Missed Notification**
 
 ```
-错误做法（不持锁调用 wait）：
-
-  时间线 →
-  Worker：检查 ready_queue 为空... 准备调用 wait...
-  主线程：                        ← 这个间隙插入！
-          往 ready_queue 放了任务
-          调用 notify_all()
-  Worker：                        调用 wait() → 睡着了
+❌ 错误示范（不持锁检查条件）：
+  Worker: 看一眼队列为空... 准备睡觉...
+         ↑ 间隙！
+  主线程:   塞入任务 → notify_all()
+  Worker:   开始睡觉 → 错过 notify → 永远睡下去
   
-  Worker 错过了 notify！因为 notify 发生在 wait 之前。
-  主线程以为已经通知了，不会再次 notify。
-  → Worker 永远睡着 → 死锁
-
-正确做法（持锁调用 wait）：
-  Worker 先 lock()，再检查条件，再 wait()
-  主线程必须 lock() 后才能修改 ready_queue 和 notify
-  → 要么 Worker 检查时就看到了新任务（不需要 wait）
-  → 要么 Worker 先 wait 了，主线程后 notify（Worker 被正确唤醒）
-  不可能错过
+✅ 正确示范（持锁检查）：
+  Worker: lock() → 看一眼队列为空 → wait() 原子放锁睡觉
+         ↑ 主线程必须等 lock 才能塞任务，要么：
+         • Worker 看到任务（不需要 wait）
+         • Worker 先睡了，主线程后 notify（能收到）
 ```
 
-**为什么需要 predicate（防止 spurious wakeup）？**
+**为什么需要 predicate？——防止 Spurious Wakeup**
 
 ```
-spurious wakeup = 操作系统在没有 notify 的情况下唤醒了线程
+Spurious Wakeup = 系统"诈你"（没 notify 也把你叫醒）
 
-原因（Linux futex 实现细节）：
-  信号处理（signal）可能导致 futex_wait 提前返回
-  内核实现为了简化，允许偶尔的虚假唤醒
+原因：Linux 内核实现允许偶尔虚假唤醒（信号处理等）
 
-没有 predicate：
-  cv.wait(lk);        // 被虚假唤醒
-  // 直接开始执行 → 但条件并没有满足 → 错误！
+❌ 无 predicate：
+  cv.wait(lk);      // 被虚假唤醒
+  // 假设条件满足 → 开始执行 → 结果条件其实不满足 → Bug！
 
-有 predicate：
+✅ 有 predicate：
   cv.wait(lk, [&]{ return has_work || stop; });
-  // 被虚假唤醒 → 检查 predicate → false → 继续睡
-  // 被真正 notify → 检查 predicate → true → 返回
+  // 被虚假唤醒 → 检查 has_work? false → 继续睡（识破诈术）
+  // 被真正 notify → 检查 has_work? true → 起床执行
+  
+记忆口诀："wait 一定要带 predicate，否则系统诈你！"
 ```
 
 **在 Lab 2 中的体现**
 
-Sleeping 版线程池需要两个条件变量：
+```cpp
+// Worker 线程睡觉等任务
+cv_worker_.wait(lk, [this] {
+    return next_task_id_ < num_total_tasks_ || stop_;
+});
+
+// 主线程做完任务通知
+cv_done_.wait(lk, [this] {
+    return tasks_done_ == num_total_tasks_;
+});
+```
+
+| 条件变量 | 谁 wait | predicate 条件 | 谁 notify | 用 one/all |
+|:---|:---|:---|:---|:---:|
+| `cv_worker_` | 16 Workers | `有任务 || 停止` | 主线程 run() | **all** |
+| `cv_done_` | 主线程 | `全部完成` | 最后 Worker | **one** |
 
 ```
-cv_worker_：Worker 等待新任务
-  wait 条件：next_task_id_ < num_total_tasks_ || stop_
-  notify 时机：run() 设置新任务后，或析构时
-
-cv_done_：主线程等待所有任务完成
-  wait 条件：tasks_done_ == num_total_tasks_
-  notify 时机：最后一个 task 完成时
-
-这两个 CV 共用同一把 mutex（mtx_），
-保护所有共享状态的一致性访问。
+记忆口诀：
+  Worker 等任务 → "有活干或要关门"
+  主线程等完成 → "全部干完"  
+  放任务唤醒所有 → notify_all（多人可抢）
+  完成只唤醒主线程 → notify_one（只有主线程等）
 ```
 
 ---
@@ -227,91 +293,151 @@ cv_done_：主线程等待所有任务完成
 
 **直觉**
 
+> **一句话记住问题**
+> 
+> CPU 为了性能会"乱序执行"——你写的 A→B→C，实际执行的可能是 B→A→C。其他核看到的顺序可能让你大吃一惊！
+
 ```
-问题的根源：CPU 为了性能会"乱序执行"。
+现实类比：朋友圈发文
 
-你写的代码：
-  data = 42;        // 写 ①
-  ready = true;     // 写 ②
-
-CPU 可能的实际执行顺序：
-  ready = true;     // 写 ② 先执行了！（因为 ready 在 cache 中，更快）
-  data = 42;        // 写 ① 后执行
-
-另一个核看到的：
-  if (ready) {
-    use(data);      // 读到了 ready=true，但 data 还是旧值！→ Bug！
-  }
-
-这就是为什么需要内存屏障（Memory Fence）：
-  data = 42;
-  std::atomic_thread_fence(std::memory_order_release);  // 屏障：①必须在②之前可见
-  ready.store(true);
+  你发的两条朋友圈：
+    ① "今天买了新房"  (data = 42)
+    ② "准备好搬家了" (ready = true)
   
-  // 另一个核：
-  if (ready.load()) {
-    std::atomic_thread_fence(std::memory_order_acquire); // 屏障：②之后的读一定看到①
-    use(data);      // 保证看到 data=42
-  }
+  正常顺序：朋友先看到 ①，再看到 ②
+    → 朋友知道：新房已买好，可以准备搬家了 ✓
+  
+  CPU 乱序后：朋友先看到 ②，再看到 ①（或只看到 ②）
+    → 朋友："准备好搬家了"？但你房子还没买啊？→ 困惑/错误！
+    
+  内存屏障 = "必须按顺序发布"的强制机制：
+    Release 屏障："①必须先发布，才能发 ②"
+    Acquire 屏障："看到 ② 时，必须同时看到 ①"
+```
+
+**乱序执行图示**
+
+```mermaid
+flowchart TB
+    subgraph Code["你写的代码"]
+        C1["data = 42<br/>写 ①"]
+        C2["ready = true<br/>写 ②"]
+        C1 --> C2
+    end
+    
+    subgraph CPU["CPU 实际执行（可能乱序）"]
+        E1["ready = true<br/>写 ② 先执行（cache 命中，快）"]
+        E2["data = 42<br/>写 ① 后执行"]
+        E1 --> E2
+    end
+    
+    subgraph Other["另一个核看到的"]
+        O1["看到 ready=true"]
+        O2["但 data 还是旧值！"]
+        O3["use(data) → Bug！"]
+        O1 --> O2 --> O3
+    end
+    
+    Code -.->|乱序| CPU
+    CPU -.->|可见性| Other
+    
+    style Code fill:#e8f5e9,stroke:#2e7d32
+    style CPU fill:#ffebee,stroke:#c62828,stroke-width:3px
+    style Other fill:#ffebee,stroke:#c62828
 ```
 
 **机制**
 
-C++ 提供三种主要的内存序（Memory Order）：
+**C++ 内存序三档速查**
 
-| Memory Order | 保证强度 | 性能 | 何时用 |
-|---|---|---|---|
-| `seq_cst`（默认）| 最强：所有线程看到相同的全局顺序 | 最慢 | 默认选择，最安全 |
-| `acquire/release` | 中等：形成 happens-before 关系 | 中等 | 生产者-消费者模式 |
-| `relaxed` | 最弱：只保证原子性，不保证顺序 | 最快 | 纯计数器（不用于同步）|
+| 档位 | Memory Order | 保证强度 | 性能 | 使用场景 |
+|:---:|:---|:---:|:---:|:---|
+| 🥉 最强 | `seq_cst` | 全局统一顺序 | 最慢 | **默认选择**，最安全 |
+| 🥈 中等 | `acquire/release` | 成对 happens-before | 中等 | 生产者-消费者 |
+| 🥇 最弱 | `relaxed` | 仅原子性 | 最快 | 纯计数器（不同步）|
 
-**Acquire/Release 语义的核心思想：**
+**Acquire/Release 核心记忆法**
 
 ```
-Release（释放语义）：
-  "我之前写的所有数据，在这个点之后对其他线程可见"
-  类似"提交事务"——提交之后，别人才能看到你做的修改
-
-Acquire（获取语义）：
-  "从这个点开始，我能看到对方 Release 之前写的所有数据"
-  类似"刷新缓存"——获取之后，保证看到最新的数据
-
-Release + Acquire 构成 happens-before 关系：
-  线程 A：写 data → Release（unlock 或 atomic store）
-  线程 B：Acquire（lock 或 atomic load）→ 读 data
+Release（释放）= "提交按钮"：
+  按下去之前写的所有数据 → 对别人可见
   
-  保证：B 读到的 data 一定是 A 写的值（或更新的值）
+  记忆：unlock() 是 Release
+  "我把数据写好了，现在 unlock → 你们都能看到"
+
+Acquire（获取）= "刷新按钮"：
+  按下去之后读的数据 → 保证是最新的
+  
+  记忆：lock() 是 Acquire  
+  "我先 lock → 刷新缓存 → 读到的一定是最新值"
+
+口诀："Release 之前的写，Acquire 之后的读"
+```
+
+**屏障工作流程**
+
+```mermaid
+flowchart LR
+    subgraph ThreadA["线程 A"]
+        A1["写 data=42"]
+        A2["🔒 Release<br/>store(ready)"]
+        A1 --> A2
+    end
+    
+    subgraph ThreadB["线程 B"]
+        B1["🔓 Acquire<br/>load(ready)"]
+        B2["读 data"]
+        B1 --> B2
+    end
+    
+    A2 -.->|"happens-before"| B1
+    A1 -.->|"保证可见"| B2
+    
+    style A2 fill:#e3f2fd,stroke:#1565c0,stroke-width:3px
+    style B1 fill:#e3f2fd,stroke:#1565c0,stroke-width:3px
 ```
 
 **在 Lab 2 中的体现**
 
-好消息：你不需要手动使用 acquire/release。Lab 2 中用到的同步原语内部已经包含了正确的内存屏障：
+> **好消息：Lab 2 全程用默认设置，不需要手动管理！**
 
-```
-std::mutex::lock()    → 内含 Acquire 语义
-std::mutex::unlock()  → 内含 Release 语义
-std::atomic<int> 默认  → seq_cst（最强保证）
-condition_variable::wait() 返回 → 内含 Acquire（因为重新 lock 了）
-
-所以在 Sleeping 版中：
-  主线程 unlock 后 → Release：所有写入（runnable, total, next_id）对 Worker 可见
-  Worker lock 后  → Acquire：保证读到主线程的最新写入
-  → 数据一致性由 mutex 的 acquire/release 语义自动保证
+```cpp
+std::mutex::lock()           // 内含 Acquire
+std::mutex::unlock()         // 内含 Release  
+std::atomic<int> (默认)      // seq_cst（最强）
+cv.wait() 返回后             // 内含 Acquire（重新 lock）
 ```
 
-**Spinning 版的安全性：**
+| 操作 | 内存语义 | 作用 |
+|:---|:---|:---|
+| `unlock()` | **Release** | 所有写入对后续 lock 可见 |
+| `lock()` | **Acquire** | 保证看到其他线程的最新写入 |
 
 ```
-Worker 的自旋循环：
-  while (tasks_done_.load() < num_total_tasks_) {}
+Sleeping 版的 happens-before 链：
+  主线程 unlock → Release → Worker lock → Acquire → Worker 看到最新数据
+  
+记忆：unlock 是"交钥匙"，lock 是"拿钥匙"，中间有 happens-before 保证
+```
 
-这安全吗？
-  如果 tasks_done_ 是 std::atomic<int> → 安全
-  因为 atomic load 默认是 seq_cst，保证能看到其他核的 store
+**Spinning 版的安全性速查**
 
-  如果 tasks_done_ 是普通 int → 不安全！
-  编译器可能把 load 优化为只读一次寄存器，后续循环不再从内存读取
-  → 永远看不到其他线程的更新 → 死循环
+```cpp
+// ✅ 安全：atomic 默认 seq_cst
+while (tasks_done_.load() < num_total_tasks_) {}
+
+// ❌ 危险：普通 int 会被编译器优化
+while (tasks_done_ < num_total_tasks_) {}  // 可能永远循环！
+```
+
+| 变量类型 | 是否安全 | 原因 |
+|:---|:---:|:---|
+| `std::atomic<int>` | ✅ | 默认 seq_cst，保证可见 |
+| `volatile int` | ❌ | 只防编译器优化，不保证多核可见 |
+| `int` | ❌ | 可能被缓存到寄存器，永远不看内存 |
+
+```
+一句话：Spinning 版必须用 atomic，否则编译器"优化掉"你的循环！
 ```
 
 > **RDMA 映射**：RDMA Write 完成后，目标端 CPU 的缓存中可能还是旧数据（因为 DMA 绕过了 CPU cache）。这就是为什么 RDMA Write 后需要通过 `IBV_SEND_SIGNALED` + Completion 机制来确保目标端 CPU 看到最新数据。本质上是同一个"内存可见性"问题，只是 RDMA 涉及跨机器，而 Lab 2 在单机多核内。
@@ -324,66 +450,122 @@ Worker 的自旋循环：
 
 Happens-Before 是并发程序中定义操作之间可见性和顺序的偏序关系。若操作 A happens-before 操作 B（记作 A ≺ B），则 A 的效果（包括所有内存写入）保证对 B 可见。Happens-before 关系可以通过以下方式建立：（1）同一线程内的程序顺序；（2）mutex 的 unlock ≺ 后续的 lock；（3）condition_variable 的 notify ≺ 对应的 wait 返回；（4）atomic store(release) ≺ 对应的 load(acquire)。
 
-**直觉**
+---
 
+#### 四条建立规则（必须会背）
+
+| 规则 | 形式 | 含义 | Lab 2 例子 |
+|:---|:---|:---|:---|
+| 程序顺序 | A 线程内 `x=1` 在 `y=2` 前 | 同线程内前写后读成立 | `run()` 中先写 `current_runnable_` 再 `unlock()` |
+| 锁规则 | `unlock(m)` ≺ `lock(m)` | 解锁前写入，对后续拿到同一把锁的线程可见 | 主线程 `unlock(mtx_)` 后，Worker `lock(mtx_)` 读到新任务 |
+| 条件变量 | `notify` ≺ 对应 `wait` 返回 | 通知发生后，等待线程返回 | 主线程 `notify_all()`，Worker 从 `wait` 返回 |
+| 原子语义 | `store(release)` ≺ `load(acquire)` | release 前写入对 acquire 后读取可见 | `ready.store(true, release)` 与 `ready.load(acquire)` |
+
+一句话记忆：**没有同步点，就没有跨线程可见性保证。**
+
+> **四条规则的分工澄清**
+>
+> 容易让人疑惑的是：`notify ≺ wait返回` 和 `unlock ≺ lock` 同时出现，它们各自负责什么？
+>
+> | 规则 | 负责的问题 | 没有它会怎样 |
+> |:---|:---|:---|
+> | `unlock ≺ lock` | **数据可见性**：A 锁内写的东西，B 拿锁后能读到 | B 拿到锁，但读到的是旧值 |
+> | `notify ≺ wait返回` | **控制流顺序**：B 醒来是因为 A 真的 notify 了 | B 永远睡着，或莫名其妙乱醒 |
+>
+> 两者是**搭档关系，各司其职，缺一不可**：
+> - 只有 mutex 没有 CV → 数据安全，但 B 只能轮询（反复 lock→检查→unlock）
+> - 只有 CV 没有 mutex → B 能被叫醒，但看到的数据不一定正确
+>
+> `notify ≺ wait返回` 还有一个独立贡献：它是 HB 链的**中间桥梁**。例如在原子变量场景下：
+> ```
+> store(release) ≺ notify ≺ wait返回 ≺ load(acquire)
+> ```
+> 这里 `notify ≺ wait返回` 连接了 A 的 release 写入和 B 的 acquire 读取，去掉这一环链条就断了。
+> 不过对 Lab 2 而言，这属于高级用法，了解即可。
+
+---
+
+#### Lab 2 的标准 HB 链条（Sleeping 版）
+
+把 `run()` 和 Worker 交互抽象成这 6 步：
+
+```text
+主线程: 写任务元数据
+   ≺
+主线程: unlock(mtx_)   [Release]
+   ≺
+主线程: notify_all(cv_worker_)
+   ≺
+Worker : wait(cv_worker_) 返回
+   ≺
+Worker : lock(mtx_)     [Acquire]
+   ≺
+Worker : 读任务元数据并执行 runTask()
 ```
-happens-before 回答的问题：
-  "线程 B 读数据时，线程 A 写的值一定能被看到吗？"
 
-如果 A 的写 happens-before B 的读 → 一定能看到
-如果没有 happens-before 关系 → 看不看得到是随机的（数据竞争/未定义行为）
+你真正要记住的是这句：**写在 unlock 之前，读在后续 lock 之后。**
 
-建立 happens-before 的最常见方式：
-  线程 A：写 data → unlock(mtx)
-  线程 B：lock(mtx) → 读 data
-  
-  unlock ≺ lock → 写 data ≺ 读 data → B 一定看到 A 写的值
-```
+---
 
-**机制**
+#### 为什么这条链是“够用且正确”的
 
-Lab 2 Sleeping 版中的 happens-before 链：
+1. `unlock ≺ lock` 给了跨线程**数据可见性**（核心保证）——写在解锁前，读在加锁后，数据一定最新。
+2. `notify ≺ wait返回` 给了**唤醒时序**——保证 B 醒来是因为 A 真的发出了通知，而非乱醒；同时也是 HB 链中不可缺少的传递节点。
+3. 两条链叠加后，Worker 醒来并重新拿锁时，读到的是主线程写好的任务数据。
 
-```
-主线程 run()：
-  ① mtx_.lock()
-  ② current_runnable_ = runnable     // 写
-  ③ num_total_tasks_ = total         // 写
-  ④ next_task_id_ = 0                // 写
-  ⑤ tasks_done_ = 0                  // 写
-  ⑥ mtx_.unlock()                    // Release → happens-before ⑦
-  ⑦ cv_worker_.notify_all()
+这也是为什么 `wait` 一定要和同一把 `mutex` 搄配使用：**叫醒归 CV 负责，数据可见归 mutex 负责**，少了任何一方，整条链都不完整。
 
-Worker 线程：
-  ⑧ cv_worker_.wait(lk, pred)  返回  // Acquire ← happens-after ⑥
-  ⑨ 读 next_task_id_                 // 保证看到 ④ 写的 0
-  ⑩ 读 current_runnable_             // 保证看到 ② 写的 runnable
-  ⑪ 执行 runTask()
+---
 
-happens-before 链：②③④⑤ ≺ ⑥(unlock) ≺ ⑧(wait返回/lock) ≺ ⑨⑩⑪
-
-结论：Worker 被唤醒后，一定能看到主线程设置的所有任务元数据。
-这不是巧合，而是 mutex 的 acquire/release 语义保证的。
-```
-
-**在 Lab 2 中的体现**
-
-如果你在 Sleeping 版中把某些共享变量的修改放在了锁的保护**之外**：
+#### 最常见误区：锁外写共享变量
 
 ```cpp
-// 错误示例
-current_runnable_ = runnable;      // 在锁外写
-{
-    std::lock_guard<std::mutex> lk(mtx_);
-    // 只在锁内修改部分变量
-    next_task_id_ = 0;
+// ❌ 错误：锁外写导致 happens-before 链断裂
+void run(IRunnable* runnable, int total) {
+    current_runnable_ = runnable;      // 🔴 锁外！Worker 可能永远读不到
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        num_total_tasks_ = total;        // 锁内
+    }
+    cv_worker_.notify_all();
 }
-cv_worker_.notify_all();
+// 问题：current_runnable_ 的写入不在 happens-before 链中
+//       Worker 唤醒后可能看到 nullptr，导致崩溃
+
+// ✅ 正确：全部在锁内，完整 happens-before 链
+void run(IRunnable* runnable, int total) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    current_runnable_ = runnable;        // 🟢 锁内 ✓
+    num_total_tasks_ = total;            // 🟢 锁内 ✓
+    // unlock 时自动 Release，notify 时 Worker 保证能看到
+}
+// 保证：Worker 被唤醒后，current_runnable_ 和 num_total_tasks_ 一定是最新值
 ```
 
-问题：`current_runnable_` 的写不在 happens-before 链中（在锁外），Worker 可能读到旧值。这种 Bug 在大多数情况下"碰巧正确"，但在极端时序下会崩溃，极难调试。
+| 写法 | HB 链条 | 可见性 | 风险 |
+|:---|:---:|:---:|:---|
+| 锁外写 + 锁内写混用 | 断裂 | 不确定 | 随机旧值、难复现 Bug |
+| 共享状态全部锁内写 | 完整 | 有保证 | 正确 |
 
-**规则：所有共享变量的修改，必须在同一把锁的保护内完成。**
+---
+
+#### 记忆卡（面试/实现都可用）
+
+```text
+HB = 可见性契约
+
+四条规则：
+1) 程序顺序
+2) unlock ≺ lock
+3) notify ≺ wait返回
+4) release ≺ acquire
+
+Lab 2 口诀：
+写 → 解锁 → 通知 → 醒来 → 加锁 → 读
+
+工程规则：
+共享状态统一在同一把锁内修改
+```
 
 ---
 
@@ -460,8 +642,9 @@ task 完成且 tasks_done_ == total：notify_one（只通知主线程）
 - [ ] `wait()` 必须带 predicate，因为 spurious wakeup 在 Linux 上是真实存在的
 - [ ] `mutex` 的 lock/unlock 自带 acquire/release 语义，保证跨线程的数据可见性
 - [ ] 共享变量的修改必须在同一把锁内完成，否则 happens-before 链断裂，可能读到旧值
-- [ ] 通知 Worker 有新任务用 `notify_all`，通知主线程完成用 `notify_one`
-- [ ] Lab 2 全程使用默认的 `atomic`（seq_cst）和 `mutex`，不需要手动管理 memory order
+- [ ] `notify_one` 适合“只有一个消费者需要响应”的场景；`notify_all` 适合“所有等待者都需要重新检查条件”的场景（如广播状态变化）
+- [ ] mutex（`unlock ≺ lock`）负责**数据可见性**，condition_variable（`notify ≺ wait返回`）负责**唤醒时序**，两者是搄伴关系，缺一不可
+- [ ] 默认优先使用 `seq_cst`（`std::mutex` + 默认 `atomic`），只在性能瓶颈明确时才引入 `acquire/release` 等弱序模型——弱序模型极难正确推理，出 bug 多且难复现
 
 ---
 

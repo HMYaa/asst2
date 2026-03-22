@@ -18,50 +18,87 @@ Lab 2 中 16 个 Worker 线程共享 `next_task_id_`、`tasks_done_` 等变量�
 
 **定义**
 
-缓存一致性问题是指在多处理器系统中，多个处理器核心各自的缓存可能持有同一内存地址的不同副本，当某个核心修改了自己缓存中的数据时，其他核心的缓存副本变得过时（stale），如果不加以管理，程序将读到错误的值。缓存一致性协议负责保证：任何处理器在任何时刻读取某个地址时，都能获得该地址最近一次写入的值。
+一句话：**多核 CPU 各自有缓存，一个核改了数据，其他核可能读到旧值——缓存一致性协议就是用来保证"所有人看到的是同一份最新数据"的机制。**
 
 **直觉**
 
-```
-没有缓存一致性的世界：
+> **一句话记住问题**
+> 
+> 16 个人各自抄了一份同样的文档，一个人改了却不告诉大家，其他人还在看旧版 → 错误！
 
-  核 0 的 L1 cache：  counter = 5
-  核 1 的 L1 cache：  counter = 5
-  主存（DRAM）：      counter = 5
+```
+现实类比：微信群公告
+
+  场景：老板在群里发通知 "counter = 5"
   
-  核 0 执行：counter = 10（只写了自己的 L1 cache）
+  核 0：把公告截图保存到本地相册（L1 cache）
+  核 1：也把公告截图保存到本地相册
+  主存：微信群原始消息
   
-  核 0 的 L1 cache：  counter = 10  ← 新值
-  核 1 的 L1 cache：  counter = 5   ← 旧值！
-  主存（DRAM）：      counter = 5   ← 也还是旧值！
-  
-  核 1 读 counter → 得到 5 → 错误！
-  
-  缓存一致性协议的作用：
-    核 0 写 counter 时，自动通知核 1"你的副本过期了"
-    核 1 下次读 counter 时，去核 0 那里或主存拿最新值
+  问题出现：
+    核 0 私下修改自己的截图："counter = 10"
+    核 1 不知道，还看自己的旧截图："counter = 5" → 错误！
+    主存里还是 "counter = 5" → 也是旧值！
+    
+  缓存一致性协议 = 群里的 "@所有人 我已更新" 功能：
+    核 0 修改时自动 @所有人："counter 已改，你们的截图作废"
+    核 1 下次看 counter 时，必须从群（主存/核 0）重新获取
 ```
 
 **机制**
 
-硬件通过**总线嗅探（Bus Snooping）**或**目录协议（Directory Protocol）**来维护一致性。Lab 2 的测试机（16 核 ARM Graviton3）使用目录协议，但概念上用总线嗅探更容易理解。
+硬件通过**总线嗅探（Bus Snooping）**实现——所有核心像坐在会议室里，谁发言（读写数据）都被其他人听到，相关的人自动做出反应。
 
-基本思路：所有缓存都监听总线上的读写操作，当发现其他核心访问了自己缓存中的数据时，做出相应的动作（失效自己的副本，或提供最新数据）。
+```mermaid
+flowchart TB
+    subgraph Core0["核 0"]
+        C0Cache["L1 Cache<br/>counter = 10<br/>(Modified)"]
+    end
+    
+    subgraph Core1["核 1"]
+        C1Cache["L1 Cache<br/>counter = ❌ Invalid"]
+    end
+    
+    subgraph CoreN["核 2-15"]
+        CNCache["L1 Cache<br/>counter = ❌ Invalid"]
+    end
+    
+    Bus["总线嗅探<br/>监听所有访问"]
+    DRAM["主存 DRAM<br/>counter = 5 (旧)"]
+    
+    C0Cache <-->|写 counter=10<br/>广播 Invalidate| Bus
+    Bus -->|通知：你们的副本过期| C1Cache
+    Bus -->|通知：你们的副本过期| CNCache
+    C0Cache -.->|写回后更新| DRAM
+    
+    style C0Cache fill:#e3f2fd,stroke:#1565c0,stroke-width:3px
+    style C1Cache fill:#ffebee,stroke:#c62828
+    style CNCache fill:#ffebee,stroke:#c62828
+```
 
 **在 Lab 2 中的体现**
 
 ```
-Worker 0 执行 next_task_id_.fetch_add(1)：
-  ① 获取 next_task_id_ 所在 cache line 的独占权
-  ② 其他 15 个核的 cache 中该 line 被标记为 Invalid
-  ③ Worker 0 修改值，cache line 变为 Modified
-  ④ Worker 1 接下来执行 fetch_add → 发现自己的副本 Invalid
-  ⑤ 通过一致性协议从 Worker 0 的 cache 获取最新值（~20ns）
-  ⑥ 重复...
+场景：16 个 Worker 抢 next_task_id_
 
-16 个 Worker 轮流执行 fetch_add = 该 cache line 在 16 个核之间反复跳转
-这就是"cache line bouncing"，是高并发 atomic 的核心开销来源
+时间线 ──────────────────────────────────────────────►
+
+Worker 0:  fetch_add ──→ 独占 M ──→ 其他 15 核变 I
+                           ↓
+Worker 1:  发现 I ──→ 重新获取 ──→ 独占 M ──→ 其他 15 核变 I
+                           ↓
+Worker 2:  发现 I ──→ 重新获取 ──→ 独占 M ...
+
+结果：一个 cache line 在 16 个核之间"弹跳"，每次弹跳 ~20ns
+      这是 Spinning 版线程池的原子操作瓶颈
 ```
+
+| 操作 | 状态变化 | 延迟 | 是否通知其他核 |
+|:---:|:---|:---:|:---:|
+| 核 0 写 | I → M | ~50ns | ✅ 发 Invalidate |
+| 核 1 写 | I → M | ~50ns | ✅ 发 Invalidate |
+| ... | ... | ... | ... |
+| **16 核串行** | **I ↔ M 反复** | **~20-50ns/次** | **每次都广播** |
 
 ---
 
@@ -91,39 +128,60 @@ MSI 协议是最基础的缓存一致性协议，为每个缓存行（cache line
 
 **机制**
 
-MSI 状态转换图（每个 cache line 的状态机）：
+MSI 三态模型：每个 cache line 在同一时刻只能处于以下一种状态
 
+```mermaid
+flowchart LR
+    I[(I - Invalid)]
+    S[(S - Shared)]
+    M[(M - Modified)]
+    
+    I -->|"本核读<br/>加载到 S<br/>~50-80ns"| S
+    I -->|"本核写<br/>独占到 M<br/>~50-80ns"| M
+    
+    S -->|"本核读<br/>命中 L1<br/>~1ns ✓"| S
+    S -->|"本核写<br/>广播 Invalidate<br/>~20ns"| M
+    
+    M -->|"本核读/写<br/>命中 L1<br/>~1ns ✓"| M
+    M -->|"其他核读<br/>降级到 S"| S
+    
+    S -->|"其他核写<br/>副本失效"| I
+    M -->|"其他核写<br/>副本失效"| I
+    
+    style I fill:#ffe6e6,stroke:#d32f2f,stroke-width:3px
+    style S fill:#e6f7e6,stroke:#388e3c,stroke-width:3px
+    style M fill:#e6f2ff,stroke:#1976d2,stroke-width:3px
 ```
-           本核读（PrRd）
-     ┌──────────────────┐
-     │                  ↓
-   ┌───┐   本核写    ┌───┐    其他核读    ┌───┐
-   │ I │ ──────────→ │ M │ ────────────→ │ S │
-   └───┘             └───┘               └───┘
-     ↑                 │                   │
-     │   其他核写        │    其他核写        │  本核写
-     │←────────────────┘    │               │
-     │←──────────────────────┘               │
-     │                                       │
-     │←──────────────────────────────────────┘
-                                        ↑
-                                本核读    │
-                               ┌────────┘
-                               └→(自身)
-```
+
+**状态定义速查**
+
+| 状态 | 含义 | 读写权限 | 延迟 |
+|:--:|:---|:---:|:---:|
+| **I** Invalid | 无效/过期 | ❌ 不可访问 | 需重新加载 |
+| **S** Shared | 共享只读 | ✅ 读 / ❌ 写 | ~1ns (命中) |
+| **M** Modified | 独占已修改 | ✅✅ 读写最快 | ~1ns (命中) |
+
+**关键转换规则**
+
+- **I → S/M**: 需要跨核/跨内存获取数据，**慢 (~50-80ns)**
+- **S → M**: 需发送 Invalidate 使其他核副本失效，**中等 (~20ns)**  
+- **M ↔ S**: M 状态持有者需响应其他核的请求，提供数据
+- **→ I**: 所有状态都可能因其他核写入而退回 Invalid
 
 关键转换解读：
 
-| 当前状态 | 事件 | 新状态 | 动作 |
-|---------|------|--------|------|
-| I | 本核读 | S | 从主存/其他核加载，~50-80ns |
-| I | 本核写 | M | 从主存/其他核加载并独占，~50-80ns |
-| S | 本核读 | S | 直接读 L1，~1ns（最快路径）|
-| S | 本核写 | M | 发送 Invalidate 给所有持有该 line 的核，~20ns |
-| M | 本核读 | M | 直接读 L1，~1ns（最快路径）|
-| M | 本核写 | M | 直接写 L1，~1ns（最快路径）|
-| M | 其他核读 | S | 提供数据给请求核，自己降级为 S |
-| M/S | 其他核写 | I | 本核副本失效 |
+
+| 当前状态 | 事件   | 新状态 | 动作                                 |
+| ---- | ---- | --- | ---------------------------------- |
+| I    | 本核读  | S   | 从主存/其他核加载，~50-80ns                 |
+| I    | 本核写  | M   | 从主存/其他核加载并独占，~50-80ns              |
+| S    | 本核读  | S   | 直接读 L1，~1ns（最快路径）                  |
+| S    | 本核写  | M   | 发送 Invalidate 给所有持有该 line 的核，~20ns |
+| M    | 本核读  | M   | 直接读 L1，~1ns（最快路径）                  |
+| M    | 本核写  | M   | 直接写 L1，~1ns（最快路径）                  |
+| M    | 其他核读 | S   | 提供数据给请求核，自己降级为 S                   |
+| M/S  | 其他核写 | I   | 本核副本失效                             |
+
 
 **在 Lab 2 中的体现**
 
@@ -152,46 +210,102 @@ Worker 1 的视角：
 
 **定义**
 
-MESI 协议是 MSI 的扩展，增加了第四种状态 Exclusive（独占但未修改）。Exclusive 状态表示该 cache line 只有本核持有且与主存一致——此时写入可以直接从 E 转为 M，无需发送总线 Invalidate 消息（因为没有其他核持有副本）。MESI 优化了"先读后写"这一常见模式的性能。
+MESI 协议在 MSI 三态基础上增加 Exclusive（独占未修改）状态。一句话概括：**MESI 解决了 "独占读" 场景下的无效广播问题——当只有一个核心读数据时，标记为 E（独占但未改），后续写操作可直接静默转为 M，无需通知其他核。**
 
 **直觉**
 
-```
-MSI 的问题：
-  核 0 读一个只有自己用的变量 → 进入 Shared 状态
-  核 0 写这个变量 → 从 S 转 M，必须发 Invalidate 广播
-  但实际上没有别人有副本！Invalidate 白发了。
+> **一句话记住区别**
+> 
+> MSI：读 → 共享(S) → 写 → 广播 Invalidate → 转修改(M)  
+> MESI：读 → 独占(E) → 写 → 静默转修改(M)，**无广播**
 
-MESI 的改进：
-  核 0 读一个只有自己用的变量 → 进入 Exclusive 状态（不是 Shared）
-  核 0 写这个变量 → 从 E 直接转 M，不需要 Invalidate
-  → 省了一次总线事务
+```
+现实类比：借书
+
+  MSI 模式：
+    你借了一本书 → 图书馆标记"此书有人借"（Shared）
+    你想在书上做笔记 → 必须广播"所有人把你们的副本扔掉！"
+    但实际上只有你一个人有这本书...白喊了
+    
+  MESI 模式：
+    你借书时，图书馆检测到"只有你借" → 标记"仅你持有，未涂改"（Exclusive）
+    你想做笔记 → 直接写，无需广播（因为本来就没别人有）
+    → 省了一次大喇叭通知
 ```
 
 **机制**
 
-```
-MESI 四种状态：
-  M（Modified）：独占 + 已修改（与 MSI 相同）
-  E（Exclusive）：独占 + 未修改（MESI 新增）
-  S（Shared）：  共享（与 MSI 相同）
-  I（Invalid）： 无效（与 MSI 相同）
+| 协议 | 状态数 | "先读后写" 自己的变量 | 是否需要广播 |
+|:--:|:--:|:---|:---:|
+| **MSI** | 3 | I → S → M | ✅ 必须 Invalidate |
+| **MESI** | 4 | I → **E** → M | ❌ **无需广播** |
 
-关键区别：
-  当只有一个核读某个 cache line 时：
-    MSI：进入 S 状态
-    MESI：进入 E 状态（因为侦测到没有其他核持有副本）
-  
-  后续写操作：
-    MSI：S → M，需要 Invalidate 广播
-    MESI：E → M，静默转换（Silent Transition），零额外开销
 ```
+关键场景对比（只有一个核访问变量 x）：
+
+  时间线 ──────────────────────────────────────────────►
+  
+  MSI：
+    核 0:  读 x  ──→ S状态 ──→ 写 x ──→ 广播 Invalidate ──→ M状态
+                         ↑                              
+                         └────── 浪费！明明只有我一个 ────┘
+                         
+  MESI：
+    核 0:  读 x  ──→ E状态 ──→ 写 x ──→ 静默转 M
+                         ↑
+                         └────── E状态记录"仅我持有未修改"────┘
+```
+
+**MESI vs MSI 本质区别图解**
+
+```mermaid
+flowchart LR
+    subgraph MSI["MSI 协议 (3状态)"]
+        direction TB
+        I1[I] -->|读| S1[S]
+        S1 -->|写<br/>发广播| M1[M]
+        style S1 fill:#ffebee,stroke:#c62828
+    end
+    
+    subgraph MESI["MESI 协议 (4状态)"]
+        direction TB
+        I2[I] -->|读| E[E]
+        E -->|写<br/>静默| M2[M]
+        I2 -.->|有其他核<br/>才进| S2[S]
+        style E fill:#e3f2fd,stroke:#1565c0,stroke-width:3px
+        style M2 fill:#e3f2fd,stroke:#1565c0
+    end
+    
+    style MSI fill:#fafafa,stroke:#666
+    style MESI fill:#f5f5f5,stroke:#666
+```
+
+**四态速查卡**
+
+| 状态 | 独占？ | 与内存一致？ | 核心场景 |
+|:--:|:---:|:---:|:---|
+| **M** | ✅ 独占 | ❌ 已改 | 刚写完，还没刷回内存 |
+| **E** | ✅ 独占 | ✅ **未改** | **MESI 优化点**：读时只有你一人 |
+| **S** | ❌ 共享 | ✅ 一致 | 多人只读 |
+| **I** | ❌ 无效 | - | 过期或从未加载 |
 
 **在 Lab 2 中的体现**
 
-MESI 的 Exclusive 状态对 Lab 2 的影响不大，因为 `next_task_id_` 等热点变量几乎始终处于多核竞争状态（16 个 Worker 都在访问），很少有机会进入 E 状态。
+> **记住这个结论**：
+> - `next_task_id_`（16 核争抢）→ 永远 I↔M，**E 状态无用**
+> - `per_thread_counter`（仅 1 核访问）→ I→E→M，**省一次广播**
 
-但对于每个 Worker 线程自己的局部状态（如循环计数器），MESI 的 E→M 无广播优化会显著提高性能——前提是这些局部变量没有被 False Sharing 干扰（下面讲）。
+```
+变量类型          是否进入 E 状态        性能收益
+─────────────────────────────────────────────────────
+next_task_id_     ❌ 16 核竞争，无法独占    无
+
+tasks_done_       ❌ 多核更新进度          无
+
+loop_counter      ✅ 仅本核读写            有（消除 S→M 广播）
+```
+
+**一句话总结**：MESI 的 E 状态只对"真正独占"的变量有效。Lab 2 的热点变量都是多核共享的，所以 MSI vs MESI 对你的原子操作性能**无差别**——但别让你的局部变量因为 False Sharing 失去 E 状态的机会！
 
 ---
 
@@ -199,28 +313,60 @@ MESI 的 Exclusive 状态对 Lab 2 的影响不大，因为 `next_task_id_` 等�
 
 **定义**
 
-False Sharing 是指多个处理器核心访问不同的变量，但这些变量恰好位于同一个缓存行（cache line，通常 64 字节）内。当某个核心写入自己的变量时，整个缓存行被标记为 Modified，导致其他核心的同一缓存行副本被 Invalidate，即使其他核心访问的是该行内完全不同的变量。结果是：逻辑上无关的操作产生了和真正的数据共享相同的一致性开销。
+一句话：**不同的变量恰好在同一个 cache line（64字节）里，你写你的、我读我的，但因为硬件只能追踪"整行"，我的缓存被你的写操作误伤失效——这就是"假共享"。**
 
 **直觉**
 
+> **一句话记住问题**
+> 
+> 两个人在一张大桌子两端各写各的文档，你一写字，管理员就过来说"整张桌子被改了，你的文档可能过期了"——其实根本没碰你的文档！
+
 ```
-False Sharing 的现实类比：
+现实类比：酒店保险箱
 
-  你和同事在同一张大桌子（cache line = 64 bytes）上各写各的文件。
+  场景：酒店有一个大保险箱（cache line = 64 字节），分成 16 个小格子
   
-  每次你写字时，桌子的"版本号"就变了，
-  同事被迫停下来确认"你有没有动到我的文件"。
+  房客 A 的护照  → 放在格子 0  
+  房客 B 的现金  → 放在格子 15
   
-  实际上你只动了桌子左边，同事的文件在右边，互不相干。
-  但因为操作系统（缓存一致性协议）只能追踪到"整张桌子"的粒度，
-  它无法区分"同一桌子的不同位置"。
+  问题：
+    房客 A 打开保险箱取护照 → 前台登记"保险箱使用中"
+    房客 A 改完护照放回去  → 前台广播"该保险箱已更新，所有人来确认"
+    房客 B 明明只关心格子 15 的现金，也被迫跑一趟前台确认
+    
+  False Sharing = 保险箱的"整箱锁定"机制，无法只锁定单个格子
   
-  结果：你们俩虽然在做完全独立的事，速度却被彼此拖慢了。
+  解决方案：
+    给每个房客单独一个保险箱（alignas(64)）→ 互不干扰
 ```
 
-**机制**
+**图示：False Sharing 如何发生**
 
-**错误示例——导致 False Sharing 的代码：**
+```mermaid
+flowchart TB
+    subgraph CacheLine["一个 Cache Line（64 字节）"]
+        direction LR
+        V1["next_task_id_<br/>字节 0-3"]
+        Pad1["...填充..."]
+        V2["tasks_done_<br/>字节 60-63"]
+    end
+    
+    subgraph Cores["两个核心"]
+        C0["核 0: 只写 next_task_id_"]
+        C1["核 1: 只读 tasks_done_"]
+    end
+    
+    C0 -->|写 next_task_id_| V1
+    V1 -->|整行标记为 M| Invalidate
+    Invalidate -->|使核 1 的副本失效| C1
+    
+    C1 -.->|被迫重新加载<br/>虽然根本没碰 tasks_done_| V2
+    
+    style CacheLine fill:#fff3e0,stroke:#ef6c00,stroke-width:3px
+    style Invalidate fill:#ffebee,stroke:#c62828
+```
+
+**代码示例**
 
 ```cpp
 struct TaskSystem {
@@ -286,172 +432,198 @@ Lab 2 的规模（16 线程）下，False Sharing 的影响通常在 10-30% 范�
 
 **定义**
 
-Cache Line Bouncing 是指一个频繁被多个处理器核心读写的缓存行，在这些核心的私有缓存之间反复迁移的现象。每次迁移都涉及一致性协议的通信开销（Invalidate + 数据传输），导致每次访问的延迟从 L1 级别（~1ns）退化到 L3 甚至跨核传输级别（~20-100ns）。
+一句话：**同一个 cache line 在多个 CPU 核之间来回"踢皮球"，每次传递都要Invalidate对方的缓存——这就是高并发 atomic 操作变慢的根本原因。**
 
 **直觉**
 
+> **一句话记住问题**
+> 
+> 一本只有一本的书，16 个人轮流看，每次传手都要 20ns——大部分时间花在"递书"，而不是"看书"。
+
 ```
-一本只有一本的参考书，被 16 个学生争抢：
+现实类比：接力棒
 
-  学生 A 拿走看 → 学生 B 要看 → A 不得不还回去 → B 拿走 →
-  学生 C 要看 → B 还回去 → C 拿走 → ...
-
-  每次"传递"需要 20ns
-  16 个学生轮流传，一轮 = 16 × 20ns = 320ns
-  每个学生一轮只看了一次 → 吞吐率 = 16 / 320ns = 50M 次/秒
-
-  如果每人有自己的副本（只读场景）：
-    每人 1ns 看一次 → 吞吐率 = 16 / 1ns = 16G 次/秒
-    快了 320 倍！
+  场景：16 个跑者传递一根接力棒（cache line）
+  
+  传递过程：
+    跑者 0 拿到棒 ──→ 跑者 1 要跑 ──→ 0 传给 1（20ns）
+    跑者 1 拿到棒 ──→ 跑者 2 要跑 ──→ 1 传给 2（20ns）
+    ...
+    
+  一轮 16 人 = 16 × 20ns = 320ns
+  每人实际"跑步"（计算）可能只要 1ns
+  但"传棒"（一致性开销）占了 99% 时间！
+  
+  理想情况（每人有自己的书）：
+    16 人同时读自己的书 ──→ 吞吐率 = 16G/秒
+    接力棒模式              ──→ 吞吐率 = 50M/秒
+    
+  差距：**320 倍！**
 ```
 
 **机制**
 
-Lab 2 中 cache line bouncing 的热点变量：
-
+```mermaid
+flowchart LR
+    subgraph Core0["核 0"]
+        CL0["📄 cache line<br/>(M 状态)"]
+    end
+    
+    subgraph Core1["核 1"]
+        CL1["📄 cache line<br/>(M 状态)"]
+    end
+    
+    subgraph Core2["核 2"]
+        CL2["📄 cache line<br/>(M 状态)"]
+    end
+    
+    Core0 -.->|Invalidate + 传数据<br/>~20ns| Core1
+    Core1 -.->|Invalidate + 传数据<br/>~20ns| Core2
+    Core2 -.->|...继续传递| CoreN["核 3-15"]
+    CoreN -.->|循环回来| Core0
+    
+    style CL0 fill:#e3f2fd,stroke:#1565c0
+    style CL1 fill:#e3f2fd,stroke:#1565c0
+    style CL2 fill:#e3f2fd,stroke:#1565c0
 ```
-热度排名（从高到低）：
 
-1. next_task_id_（最热）：
-   每个 task 分配一次 fetch_add → 如果有 10000 个 task，
-   bouncing 10000 次，每次 ~20ns → 总开销 ~200μs
+**Lab 2 热点变量 bouncing 排名**
 
-2. tasks_done_（次热）：
-   每个 task 完成一次 fetch_add/increment → 同样 bouncing
-
-3. mutex 内部状态（中等）：
-   Sleeping 版中 lock/unlock 涉及原子操作
-   但频率低于 next_task_id_（因为锁的粒度可以设计得粗一些）
-
-4. condition_variable 内部状态（低）：
-   notify/wait 的频率远低于单个 task 的分配
-```
+| 排名 | 变量 | 触发频率 | 性能影响 |
+|:---:|:---|:---:|:---:|
+| 🥇 | `next_task_id_` | 每个 task 一次 | **最严重** |
+| 🥈 | `tasks_done_` | 每个 task 一次 | 严重 |
+| 🥉 | `mutex` 状态 | 每次 lock/unlock | 中等（粒度可粗化） |
+| 4 | `condition_variable` | 每次 notify/wait | 低（频率远低于 task） |
 
 **在 Lab 2 中的体现**
 
-这是 Spinning 版和 Sleeping 版在轻量任务上的性能差异的根本原因：
+> **核心对比：Spinning vs Sleeping 的 bouncing 差异**
 
 ```
-Spinning 版：
-  16 个 Worker 不停地 fetch_add(next_task_id_)
-  即使没有新任务，也在无意义地 bouncing → CPU 空转 + cache 污染
-  主线程也在 spin-wait tasks_done_ → 又多了一个竞争者
+Spinning 版（16 Worker 空转）：
+  ┌─────────────────────────────────────────────────────┐
+  │ Worker 0: fetch_add ──→ M ──→ Worker 1 抢 ──→ I   │
+  │ Worker 1: fetch_add ──→ M ──→ Worker 2 抢 ──→ I   │
+  │ ... 无限循环，即使没 task 也在 bounce！             │
+  │ 主线程: spin-wait tasks_done_ → 又多一个竞争者      │
+  └─────────────────────────────────────────────────────┘
+  结果：CPU 100% + 缓存污染 + 无效 bouncing
 
-Sleeping 版：
-  无任务时 Worker 睡眠，不会 bounce 任何 cache line
-  有任务时才 fetch_add → bouncing 次数 = 实际 task 数量（无浪费）
-  主线程也在 cv_done.wait 睡眠 → 不参与竞争
-
-结论：Sleeping 版在轻量任务上显著减少了无效的 cache line bouncing
+Sleeping 版（智能等待）：
+  ┌─────────────────────────────────────────────────────┐
+  │ 无任务时: 所有 Worker 睡眠 → 零 bouncing            │
+  │ 有任务时: 仅实际 task 数量次 fetch_add → 按需 bounce │
+  │ 主线程: cv.wait() 睡眠 → 不参与竞争                 │
+  └─────────────────────────────────────────────────────┘
+  结果：轻量任务性能提升 5-10 倍
 ```
+
+| 场景 | Spinning 版 bouncing 次数 | Sleeping 版 bouncing 次数 |
+|:---|:---:|:---:|
+| 轻量 task（执行 10ns）| 无限（CPU 空转）| = task 数量 |
+| 重量 task（执行 1ms）| = task 数量 | = task 数量 |
+| 无 task 时 | 无限 ❌ | 0 ✅ |
 
 ---
 
-## 关键结论
+## 关键结论速查卡
 
-- [ ] 每个核有独立的 L1/L2 cache，共享数据需要一致性协议来保证正确性
-- [ ] MSI/MESI 协议通过 Invalidate 消息使其他核的缓存副本失效，这不是免费的（~20ns/次）
-- [ ] `atomic<int>` 的 `fetch_add` 每次执行都会触发 cache line bouncing，延迟 ~20-50ns
-- [ ] False Sharing 是最隐蔽的性能 Bug：不同变量在同一 cache line 里导致互相干扰
-- [ ] 修复 False Sharing 用 `alignas(64)` 让关键变量独占 cache line
-- [ ] Spinning 版的"空转"不只是浪费 CPU——还在无意义地 bounce cache line，拖慢真正干活的 Worker
-- [ ] 优先保证算法正确，最后再调 False Sharing——这是 10-30% 级别的优化，不是量级优化
+| 概念 | 一句话总结 | Lab 2 应用 |
+|:---|:---|:---|
+| **Cache Coherence** | 多核各自有缓存，需要协议保证"所有人看同一最新值" | `next_task_id_` 被 16 核争抢 |
+| **MSI 协议** | 三态：I(无效) → S(共享只读) → M(独占可写) | 每次 `fetch_add` 触发 I↔M 转换 |
+| **MESI 协议** | 新增 E(独占未改)，解决"只有自己用"场景的无效广播 | Lab 2 热点变量用不上 E 状态 |
+| **False Sharing** | 不同变量在同一 cache line，互拖后腿 | `alignas(64)` 隔离变量 |
+| **Cache Line Bouncing** | 同一行在多核间"踢皮球"，每次 20ns | Spinning 版空转时无限 bouncing |
+
+**性能优化优先级**
+
+```
+1. 算法正确性（必须对）
+2. 同步逻辑设计（Sleeping vs Spinning）
+3. 锁粒度优化（减少竞争）
+4. False Sharing（最后微调 10-30%）
+```
+
+**一句话记住**
+
+> Spinning 版慢 ≠ CPU 浪费，而是 cache line 在 16 核之间来回"踢皮球"，每次传递都要 20ns！
+> Sleeping 版快 = 没任务时零 bouncing，有任务时才按实际数量 bounce。
 
 ---
 
 ## 自测
 
-**[判断题 1]**
-T/F：在 MSI 协议中，一个 cache line 可以同时在两个核的缓存中处于 Modified 状态。
+**[判断题 1]**  
+在 MSI 协议中，一个 cache line 可以同时在两个核的缓存中处于 Modified 状态。
 
 <details>
 <summary>答案</summary>
 
-**F（错误）**。Modified 状态意味着"只有本核有最新数据"，这是独占的。如果两个核同时 M，就无法确定谁的版本更新，一致性被破坏。一致性协议保证任何时刻最多一个核持有 M 状态。
+**错误** ❌  
+M 状态 = "只有我独占且最新"，两个核同时 M 会违背一致性。任何时刻最多一个核能持有 M 状态。
 </details>
 
 ---
 
-**[判断题 2]**
-T/F：如果一个变量只被一个线程读写，它永远不会因为 cache coherence 产生额外开销。
+**[判断题 2]**  
+如果一个变量只被一个线程读写，它永远不会因为 cache coherence 产生额外开销。
 
 <details>
 <summary>答案</summary>
 
-**不完全正确（取决于 False Sharing）**。如果该变量独占一个 cache line，确实不会有一致性开销（始终在 M 或 E 状态）。但如果和其他线程频繁修改的变量共享同一个 cache line，就会因为 False Sharing 而被反复 Invalidate，即使自己从未被其他线程访问。
+**不完全正确** ⚠️  
+- ✅ 变量独占 cache line → 无开销（始终在 M/E 状态）  
+- ❌ 变量与其他线程变量同处一行 → **False Sharing**！你的缓存会被别人的写操作误伤 Invalidate
 </details>
 
 ---
 
-**[思考题 1]**
-在 Lab 2 的 Spinning 版线程池中，假设有 16 个 Worker 线程，每个 task 执行时间为 100ns。单次 `fetch_add` 由于 cache line bouncing 的延迟为 30ns。那么实际的 task 吞吐率（tasks/sec）大约是多少？和理想情况（无 bouncing 开销）相比，效率损失了多少？
+**[计算题]**  
+Lab 2 Spinning 版：16 Worker，task 执行 100ns，`fetch_add` bouncing 延迟 30ns。实际吞吐率和效率损失？
 
 <details>
-<summary>参考思路</summary>
+<summary>答案</summary>
 
-**理想情况（无 bouncing）：**
-- 16 个 Worker 各自独立执行 task
-- 每个 Worker 的吞吐率 = 1 task / 100ns
-- 总吞吐率 = 16 / 100ns = 160M tasks/sec
+**瓶颈分析：**
+- 计算吞吐率：16 / 100ns = **160M tasks/sec**
+- fetch_add 吞吐率：1 / 30ns = **33M/sec**（串行瓶颈！）
+- **实际吞吐率 = 33M/sec**（由 fetch_add 决定）
 
-**有 bouncing 时：**
-- 每个 task 的实际处理时间 = 100ns（计算）+ 30ns（fetch_add bouncing）= 130ns
-- 但 fetch_add 是串行瓶颈：16 个线程排队执行 fetch_add
-- fetch_add 吞吐率 = 1 / 30ns ≈ 33M/sec（全局上限）
-- 16 个 Worker 的计算吞吐率 = 160M/sec
+**效率损失：**  
+33M / 160M = **20.6%** ⚠️  
 
-瓶颈取决于哪个更小：
-- 计算吞吐率：160M/sec
-- fetch_add 吞吐率：33M/sec
-- 瓶颈 = **33M/sec**（fetch_add 成为瓶颈！）
-
-效率 = 33M / 160M = **20.6%**
-
-结论：当 task 执行时间（100ns）和 fetch_add 延迟（30ns）在同一数量级时，atomic 操作成为严重瓶颈。这就是 `super_super_light` 测试中 Spinning 版表现差的原因。
+> 结论：当 task 很轻（100ns）时，atomic 操作（30ns）成为严重瓶颈。这就是 `super_super_light` 测试中 Spinning 版惨败的原因。
 </details>
 
 ---
 
-**[代码预测题]**
-以下代码在 16 线程运行时，`total` 的最终值会是正确的 160000 吗？有没有性能问题？
+**[代码预测题]**  
+以下代码正确吗？有性能问题吗？
 
 ```cpp
 struct Counters {
     std::atomic<int> per_thread_count[16];  // 每线程一个计数器
 };
-
-Counters counters;
-
-void worker(int tid) {
-    for (int i = 0; i < 10000; i++) {
-        counters.per_thread_count[tid].fetch_add(1);
-    }
-}
-
-// 16 个线程各自执行 worker(0), worker(1), ..., worker(15)
-// 最后 total = sum of per_thread_count[0..15]
 ```
 
 <details>
-<summary>分析</summary>
+<summary>答案</summary>
 
-**正确性：是的，total = 160000。** 每个线程只写自己的 `per_thread_count[tid]`，没有数据竞争。
+**正确性：✅ 正确**  
+每个线程只写自己的元素，无数据竞争。
 
-**性能问题：有严重的 False Sharing！**
+**性能：❌ 严重 False Sharing！**  
+`16 × 4 字节 = 64 字节`，恰好填满一个 cache line！16 个线程互相 Invalidate。
 
-`std::atomic<int>` 大小为 4 字节。`per_thread_count[16]` 是连续的 64 字节（16×4），恰好**完整覆盖一个 cache line**。
-
-这意味着所有 16 个线程的计数器在同一个 cache line 里。线程 0 修改 `per_thread_count[0]` 会 Invalidate 线程 1 的 `per_thread_count[1]` 的缓存，即使它们是不同的变量。
-
-修复：
-
+**修复：**
 ```cpp
 struct alignas(64) PaddedCounter {
     std::atomic<int> count;
 };
-
-PaddedCounter per_thread_count[16];  // 每个计数器独占一个 cache line
+PaddedCounter per_thread_count[16];  // 各独占一行
 ```
-
-修复后性能可能提升 **5-10 倍**（因为消除了无意义的 cache line bouncing）。
+性能提升 **5-10 倍**。
 </details>
+

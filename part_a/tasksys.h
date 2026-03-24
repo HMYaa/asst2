@@ -53,6 +53,14 @@ class TaskSystemParallelThreadPoolSpinning: public ITaskSystem {
         void sync();
 };
 
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+#include <vector>
+#include <atomic>
+#include <functional>
+
 /*
  * TaskSystemParallelThreadPoolSleeping: This class is the student's
  * optimized implementation of a parallel task execution engine that uses
@@ -68,6 +76,16 @@ class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
         TaskID runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
                                 const std::vector<TaskID>& deps);
         void sync();
+
+    private:
+        int num_threads_;
+        std::vector<std::thread> threads_;
+        std::queue<std::function<void()>> task_queue_;
+        std::mutex queue_mutex_;
+        std::condition_variable queue_cv_;
+        std::atomic<bool> stop_;
+        
+        void worker_thread();
 };
 
 #endif

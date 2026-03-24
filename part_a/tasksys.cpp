@@ -179,10 +179,7 @@ TaskSystemParallelThreadPoolSleeping::~TaskSystemParallelThreadPoolSleeping() {
 }
 
 void TaskSystemParallelThreadPoolSleeping::run(IRunnable* runnable, int num_total_tasks) {
-    // 重置停止标志（如果之前被设置过）
-    if (stop_) {
-        stop_ = false;
-    }
+    // 不要重置 stop_ 标志，因为工作线程应该保持运行
     
     // 将任务加入队列
     {
@@ -203,13 +200,7 @@ void TaskSystemParallelThreadPoolSleeping::run(IRunnable* runnable, int num_tota
         std::unique_lock<std::mutex> lock(queue_mutex_);
         queue_cv_.wait(lock, [this]() { return task_queue_.empty(); });
     }
-    
-    // 通知工作线程停止（因为任务已完成）
-    {
-        std::unique_lock<std::mutex> lock(queue_mutex_);
-        stop_ = true;
-    }
-    queue_cv_.notify_all();
+    // 注意：不要设置 stop_ = true，因为工作线程需要保持活动状态
 }
 
 TaskID TaskSystemParallelThreadPoolSleeping::runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,

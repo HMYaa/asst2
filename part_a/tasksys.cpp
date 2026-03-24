@@ -179,14 +179,20 @@ TaskSystemParallelThreadPoolSleeping::~TaskSystemParallelThreadPoolSleeping() {
 }
 
 void TaskSystemParallelThreadPoolSleeping::run(IRunnable* runnable, int num_total_tasks) {
-    // 不要重置 stop_ 标志，因为工作线程应该保持运行
+    // 使用原子计数器跟踪未完成的任务
+    std::atomic<int> remaining_tasks{num_total_tasks};
+    std::condition_variable done_cv;
+    std::mutex done_mutex;
     
     // 将任务加入队列
     {
         std::unique_lock<std::mutex> lock(queue_mutex_);
         for (int i = 0; i < num_total_tasks; i++) {
-            task_queue_.emplace([runnable, i, num_total_tasks]() {
+            task_queue_.emplace([runnable, i, num_total_tasks, &remaining_tasks, &done_cv]() {
                 runnable->runTask(i, num_total_tasks);
+                if (--remaining_tasks == 0) {
+                    done_cv.notify_one();
+                }
             });
         }
     }
@@ -197,10 +203,9 @@ void TaskSystemParallelThreadPoolSleeping::run(IRunnable* runnable, int num_tota
     
     // 等待所有任务完成
     {
-        std::unique_lock<std::mutex> lock(queue_mutex_);
-        queue_cv_.wait(lock, [this]() { return task_queue_.empty(); });
+        std::unique_lock<std::mutex> lock(done_mutex);
+        done_cv.wait(lock, [&remaining_tasks]() { return remaining_tasks == 0; });
     }
-    // 注意：不要设置 stop_ = true，因为工作线程需要保持活动状态
 }
 
 TaskID TaskSystemParallelThreadPoolSleeping::runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,

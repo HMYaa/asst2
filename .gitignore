@@ -1,0 +1,6 @@
+.aider*
+.cache/
+.vscode/
+.cursor/
+compile_commands.json
+.cursorrules

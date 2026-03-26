@@ -1,3 +1,8 @@
+---
+description: 
+alwaysApply: true
+---
+
 **Role**: 你是一名深耕高性能计算（HPC）和底层网络协议栈（如 NCCL/RDMA）的资深架构师。
 **Task**: 请分析当前目录下 CS149 Lab 2 的代码框架（尤其是 `task_scheduler.h/cpp` 和 `main.cpp`）。
 

@@ -5,6 +5,9 @@
 #include <thread>
 #include <vector>
 #include <atomic>
+#include <queue>
+#include <functional>
+
 
 /*
  * TaskSystemSerial: This class is the student's implementation of a
@@ -58,6 +61,12 @@ class TaskSystemParallelThreadPoolSpinning: public ITaskSystem {
         TaskID runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
                                 const std::vector<TaskID>& deps);
         void sync();
+        void enqueue(std::function<void()> task);
+    private:
+        std::vector<std::thread> workers;
+        std::queue<std::function<void()>> tasks;
+        std::atomic_flag spin_lock = ATOMIC_FLAG_INIT;
+        std::atomic<bool> stop;
 };
 
 /*

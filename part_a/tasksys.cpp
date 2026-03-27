@@ -1,5 +1,7 @@
 #include "tasksys.h"
-
+#include <emmintrin.h> // 必须包含这个头文件以使用 _mm_pause()
+#include <condition_variable>
+#include <mutex>
 
 IRunnable::~IRunnable() {}
 
@@ -117,16 +119,60 @@ const char* TaskSystemParallelThreadPoolSpinning::name() {
     return "Parallel + Thread Pool + Spin";
 }
 
-TaskSystemParallelThreadPoolSpinning::TaskSystemParallelThreadPoolSpinning(int num_threads): ITaskSystem(num_threads) {
+TaskSystemParallelThreadPoolSpinning::TaskSystemParallelThreadPoolSpinning(int num_threads): 
+    ITaskSystem(num_threads),spin_lock(ATOMIC_FLAG_INIT),stop(false),workers() {
     //
     // TODO: CS149 student implementations may decide to perform setup
     // operations (such as thread pool construction) here.
     // Implementations are free to add new class member variables
     // (requiring changes to tasksys.h).
     //
+ 
+    for (size_t i = 0; i < num_threads; i ++) {
+        workers.emplace_back([this]{
+            while(!this->stop.load(std::memory_order_acquire)) {
+                std::function<void()> task;
+                bool got_task = false;
+
+                while (spin_lock.test_and_set(std::memory_order_acquire)) {
+                    _mm_pause();
+                }
+
+                if (!this->tasks.empty()) {
+                    task = this->tasks.front();
+                    this->tasks.pop();
+                    got_task = true;
+                }
+
+                spin_lock.clear(std::memory_order_release);
+                
+                if (got_task) {
+                    task();
+                } else {
+                    _mm_pause();
+                }
+            }            
+        });
+    }
 }
 
-TaskSystemParallelThreadPoolSpinning::~TaskSystemParallelThreadPoolSpinning() {}
+TaskSystemParallelThreadPoolSpinning::~TaskSystemParallelThreadPoolSpinning() {
+    stop.store(true, std::memory_order_release);
+    for (auto &worker : workers) {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+}
+
+void TaskSystemParallelThreadPoolSpinning::enqueue(std::function<void()> task) { 
+    while (spin_lock.test_and_set(std::memory_order_acquire)) {
+        _mm_pause();
+    }
+    
+    tasks.push(task);
+    spin_lock.clear(std::memory_order_release);
+}
 
 void TaskSystemParallelThreadPoolSpinning::run(IRunnable* runnable, int num_total_tasks) {
 
@@ -136,10 +182,24 @@ void TaskSystemParallelThreadPoolSpinning::run(IRunnable* runnable, int num_tota
     // method in Part A.  The implementation provided below runs all
     // tasks sequentially on the calling thread.
     //
-
-    for (int i = 0; i < num_total_tasks; i++) {
-        runnable->runTask(i, num_total_tasks);
+    int remaining_tasks = num_total_tasks;
+    std::condition_variable done_cv;
+    std::mutex done_mtx;
+    if (num_total_tasks <= 0) { 
+        return;
     }
+    for (int i = 0; i < num_total_tasks; i++) {
+        enqueue([this, runnable, i, num_total_tasks, &remaining_tasks, &done_cv]() {
+            runnable->runTask(i, num_total_tasks);
+            remaining_tasks--;
+            if (remaining_tasks <= 0) { 
+                done_cv.notify_one(); 
+            }
+        });
+    }
+    std::unique_lock<std::mutex> lk(done_mtx);
+    done_cv.wait(lk, [&]{ return remaining_tasks <= 0; });
+
 }
 
 TaskID TaskSystemParallelThreadPoolSpinning::runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,

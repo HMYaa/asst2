@@ -1,7 +1,9 @@
 #include "tasksys.h"
+#include <atomic>
 #include <emmintrin.h> // 必须包含这个头文件以使用 _mm_pause()
 #include <condition_variable>
 #include <mutex>
+#include <iostream>
 
 IRunnable::~IRunnable() {}
 
@@ -176,29 +178,32 @@ void TaskSystemParallelThreadPoolSpinning::enqueue(std::function<void()> task) {
 
 void TaskSystemParallelThreadPoolSpinning::run(IRunnable* runnable, int num_total_tasks) {
 
-
+    //std::cout << "batch start, num_total_tasks: " << num_total_tasks << std::endl;
     //
     // TODO: CS149 students will modify the implementation of this
     // method in Part A.  The implementation provided below runs all
     // tasks sequentially on the calling thread.
     //
-    int remaining_tasks = num_total_tasks;
-    std::condition_variable done_cv;
-    std::mutex done_mtx;
-    if (num_total_tasks <= 0) { 
+    if (num_total_tasks <= 0) {
         return;
     }
+    std::atomic<int> remaining_tasks{num_total_tasks};
+    std::condition_variable done_cv;
+    std::mutex done_mtx;
     for (int i = 0; i < num_total_tasks; i++) {
         enqueue([this, runnable, i, num_total_tasks, &remaining_tasks, &done_cv]() {
             runnable->runTask(i, num_total_tasks);
-            remaining_tasks--;
-            if (remaining_tasks <= 0) { 
-                done_cv.notify_one(); 
+            // std::cout << "thread id: " << std::this_thread::get_id() << " remaining_tasks: " << remaining_tasks.load() << std::endl;
+            if (remaining_tasks.fetch_sub(1) == 1) {
+                // std::cout << "notify one" << std::endl;
+                done_cv.notify_one();
             }
         });
     }
     std::unique_lock<std::mutex> lk(done_mtx);
-    done_cv.wait(lk, [&]{ return remaining_tasks <= 0; });
+    done_cv.wait(lk, [&remaining_tasks] {
+        return remaining_tasks.load() == 0;
+    });
 
 }
 

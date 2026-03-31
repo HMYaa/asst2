@@ -122,7 +122,10 @@ const char* TaskSystemParallelThreadPoolSpinning::name() {
 }
 
 TaskSystemParallelThreadPoolSpinning::TaskSystemParallelThreadPoolSpinning(int num_threads): 
-    ITaskSystem(num_threads),spin_lock(ATOMIC_FLAG_INIT),stop(false),workers() {
+    ITaskSystem(num_threads),
+    stop(false),next_task_id_(0),num_total_tasks_(0),
+    remaining_tasks(0),batch_active(false), current_runnable(nullptr), 
+    workers() {
     //
     // TODO: CS149 student implementations may decide to perform setup
     // operations (such as thread pool construction) here.
@@ -132,33 +135,28 @@ TaskSystemParallelThreadPoolSpinning::TaskSystemParallelThreadPoolSpinning(int n
  
     for (size_t i = 0; i < num_threads; i ++) {
         workers.emplace_back([this]{
-            std::function<void()> task;
-     
-
-            while (true) {
-                bool has_task = false;
-                
-                while(spin_lock.test_and_set(std::memory_order_acquire)) {
-                    _mm_pause();
-                }
- 
-                if (!this->tasks.empty()) {
-                    task = std::move(this->tasks.front());
-                    this->tasks.pop();
-                    has_task = true;
-                } else if (stop) {
-                    spin_lock.clear(std::memory_order_release);
+            while(true) {
+                if (stop.load(std::memory_order_acquire)) {
                     break;
                 }
- 
-                spin_lock.clear(std::memory_order_release);
 
-                if (has_task) {
-                    task();     // 锁外执行
+                if (!batch_active.load(std::memory_order_acquire)) {
+                    _mm_pause();
+                    continue;
+                }
+                
+                int task_id = next_task_id_.fetch_add(1);
+
+                if (task_id < num_total_tasks_) {
+                    current_runnable->runTask(task_id, num_total_tasks_);
+
+                    if (remaining_tasks.fetch_sub(1) == 1) {
+                        batch_active.store(false, std::memory_order_release);
+                    }
                 } else {
                     _mm_pause();
                 }
-            }
+            }    
         });
     }
 }
@@ -172,14 +170,14 @@ TaskSystemParallelThreadPoolSpinning::~TaskSystemParallelThreadPoolSpinning() {
     }
 }
 
-void TaskSystemParallelThreadPoolSpinning::enqueue(std::function<void()> task) { 
-    while (spin_lock.test_and_set(std::memory_order_acquire)) {
-        _mm_pause();
-    }
+// void TaskSystemParallelThreadPoolSpinning::enqueue(std::function<void()> task) { 
+//     while (spin_lock.test_and_set(std::memory_order_acquire)) {
+//         _mm_pause();
+//     }
     
-    tasks.push(std::move(task));
-    spin_lock.clear(std::memory_order_release);
-}
+//     tasks.push(std::move(task));
+//     spin_lock.clear(std::memory_order_release);
+// }
 
 void TaskSystemParallelThreadPoolSpinning::run(IRunnable* runnable, int num_total_tasks) {
 
@@ -192,24 +190,18 @@ void TaskSystemParallelThreadPoolSpinning::run(IRunnable* runnable, int num_tota
     if (num_total_tasks <= 0) {
         return;
     }
-    std::atomic<int> remaining_tasks{num_total_tasks};
     std::condition_variable done_cv;
     std::mutex done_mtx;
-    for (int i = 0; i < num_total_tasks; i++) {
-        enqueue([this, runnable, i, num_total_tasks, &remaining_tasks, &done_cv]() {
-            runnable->runTask(i, num_total_tasks);
-            // std::cout << "thread id: " << std::this_thread::get_id() << " remaining_tasks: " << remaining_tasks.load() << std::endl;
-            if (remaining_tasks.fetch_sub(1) == 1) {
-                // std::cout << "notify one" << std::endl;
-                done_cv.notify_one();
-            }
-        });
-    }
-    std::unique_lock<std::mutex> lk(done_mtx);
-    done_cv.wait(lk, [&remaining_tasks] {
-        return remaining_tasks.load() == 0;
-    });
 
+    current_runnable = runnable;
+    num_total_tasks_ = num_total_tasks;
+    next_task_id_.store(0, std::memory_order_release);
+    remaining_tasks.store(num_total_tasks, std::memory_order_release);
+    batch_active.store(true, std::memory_order_release);
+
+    while (batch_active.load(std::memory_order_acquire)) {
+        _mm_pause();
+    }
 }
 
 TaskID TaskSystemParallelThreadPoolSpinning::runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,

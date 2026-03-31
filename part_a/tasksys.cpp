@@ -132,28 +132,33 @@ TaskSystemParallelThreadPoolSpinning::TaskSystemParallelThreadPoolSpinning(int n
  
     for (size_t i = 0; i < num_threads; i ++) {
         workers.emplace_back([this]{
-            while(!this->stop.load(std::memory_order_acquire)) {
-                std::function<void()> task;
-                bool got_task = false;
+            std::function<void()> task;
+     
 
-                while (spin_lock.test_and_set(std::memory_order_acquire)) {
+            while (true) {
+                bool has_task = false;
+                
+                while(spin_lock.test_and_set(std::memory_order_acquire)) {
                     _mm_pause();
                 }
-
+ 
                 if (!this->tasks.empty()) {
-                    task = this->tasks.front();
+                    task = std::move(this->tasks.front());
                     this->tasks.pop();
-                    got_task = true;
+                    has_task = true;
+                } else if (stop) {
+                    spin_lock.clear(std::memory_order_release);
+                    break;
                 }
-
+ 
                 spin_lock.clear(std::memory_order_release);
-                
-                if (got_task) {
-                    task();
+
+                if (has_task) {
+                    task();     // 锁外执行
                 } else {
                     _mm_pause();
                 }
-            }            
+            }
         });
     }
 }
@@ -172,7 +177,7 @@ void TaskSystemParallelThreadPoolSpinning::enqueue(std::function<void()> task) {
         _mm_pause();
     }
     
-    tasks.push(task);
+    tasks.push(std::move(task));
     spin_lock.clear(std::memory_order_release);
 }
 

@@ -6,11 +6,11 @@
 
 ## 这篇文档解决什么问题
 
-- [ ] 我知道 `super_super_light` 和 `super_light` 分别在测什么
-- [ ] 我知道为什么 `ping_pong_equal` 和 `ping_pong_unequal` 要分开存在
-- [ ] 我知道哪些测试主要考线程池，哪些测试主要考真正的并行执行
-- [ ] 我知道 `spin_between_run_calls` 为什么专门针对 spinning 版不友好
-- [ ] 我能从“某个测试慢了”反推出应该先怀疑调度器的哪一部分
+- 我知道 `super_super_light` 和 `super_light` 分别在测什么
+- 我知道为什么 `ping_pong_equal` 和 `ping_pong_unequal` 要分开存在
+- 我知道哪些测试主要考线程池，哪些测试主要考真正的并行执行
+- 我知道 `spin_between_run_calls` 为什么专门针对 spinning 版不友好
+- 我能从“某个测试慢了”反推出应该先怀疑调度器的哪一部分
 
 ---
 
@@ -18,12 +18,14 @@
 
 这些测试本质上可以按 4 类能力来理解：
 
-| 类别 | 它在考什么 | 典型测试 |
-|------|------------|----------|
-| 固定开销 | 一次 `run()` 本身贵不贵 | `super_super_light`, `super_light` |
-| 吞吐能力 | 多个 worker 是否稳定并行干活 | `ping_pong_equal`, `recursive_fibonacci`, `mandelbrot_chunked` |
-| 负载均衡 | 任务不均匀时会不会出现长尾 | `ping_pong_unequal` |
-| 等待策略 | 没活时 spinning 是否浪费 CPU | `spin_between_run_calls`, Sleeping 相关 async 测试 |
+
+| 类别   | 它在考什么                 | 典型测试                                                           |
+| ---- | --------------------- | -------------------------------------------------------------- |
+| 固定开销 | 一次 `run()` 本身贵不贵      | `super_super_light`, `super_light`                             |
+| 吞吐能力 | 多个 worker 是否稳定并行干活    | `ping_pong_equal`, `recursive_fibonacci`, `mandelbrot_chunked` |
+| 负载均衡 | 任务不均匀时会不会出现长尾         | `ping_pong_unequal`                                            |
+| 等待策略 | 没活时 spinning 是否浪费 CPU | `spin_between_run_calls`, Sleeping 相关 async 测试                 |
+
 
 所以以后你看到某个测试慢，不要笼统说“性能差”，而要先判断：
 
@@ -49,6 +51,7 @@
 **机制**
 
 参考定义：
+
 - [tests/README.md:5-6](../tests/README.md#L5-L6)
 - [tests.h:668-677](../tests/tests.h#L668-L677)
 
@@ -71,8 +74,7 @@
 - `TaskSystemParallelSpawn` 如果每次都创建/销毁线程，会很容易吃亏
 - `ThreadPoolSpinning` 如果调度路径足够短，往往能在这个测试表现很好
 - `ThreadPoolSleeping` 如果 sleep / wakeup 成本过大，也可能输给 spinning
-
-- [ ] 学完后你应该能说出：这个测试主要不是测“算得快不快”，而是测“调度器自己贵不贵”
+- 学完后你应该能说出：这个测试主要不是测“算得快不快”，而是测“调度器自己贵不贵”
 
 ---
 
@@ -91,10 +93,12 @@
 **机制**
 
 参考定义：
+
 - [tests/README.md:8-9](../tests/README.md#L8-L9)
 - [tests.h:680-689](../tests/tests.h#L680-L689)
 
 参数：
+
 - `num_elements = 32 * 1024`
 - `base_iters = 32`
 - 每次 task 比 `super_super_light` 多了一定计算量
@@ -109,14 +113,15 @@
 **在 Lab 2 中的体现**
 
 如果你的 `ThreadPoolSpinning`：
+
 - 在 `super_super_light` 很好
 - 但在 `super_light` 仍然明显慢于参考实现
 
 通常意味着：
+
 - 调度大方向对了
 - 但尾部空转、主线程不干活、共享状态访问路径仍有成本
-
-- [ ] 学完后你应该能说出：`super_light` 是最适合定位“调度 vs 计算平衡点”的测试之一
+- 学完后你应该能说出：`super_light` 是最适合定位“调度 vs 计算平衡点”的测试之一
 
 ---
 
@@ -135,10 +140,12 @@
 **机制**
 
 参考定义：
+
 - [tests/README.md:11-13](../tests/README.md#L11-L13)
 - [tests.h:692-707](../tests/tests.h#L692-L707)
 
 特点：
+
 - 元素规模比 `super_light` 大得多：`512 * 1024`
 - 每次 launch 的总工作量更大
 - task 间工作量近似均衡
@@ -152,12 +159,12 @@
 **在 Lab 2 中的体现**
 
 如果你在这个测试慢，优先怀疑：
+
 - 整体吞吐不足
 - 共享状态争用太多
 - 主线程 busy-wait 干扰 worker
 - 线程池内状态切换路径不够紧凑
-
-- [ ] 学完后你应该能说出：这个测试主要看“吞吐能力”，不是只看 launch 固定成本
+- 学完后你应该能说出：这个测试主要看“吞吐能力”，不是只看 launch 固定成本
 
 ---
 
@@ -176,15 +183,18 @@
 **机制**
 
 参考定义：
+
 - [tests/README.md:14-15](../tests/README.md#L14-L15)
 - [tests.h:698-713](../tests/tests.h#L698-L713)
 - 负载不均具体逻辑见 [tests.h:174-203](../tests/tests.h#L174-L203)
 
 当 `equal_work=false` 时：
+
 - 较低索引元素需要更多迭代
 - 不同 task 负责的区间因此耗时不同
 
 如果你是静态切分，很容易发生：
+
 - 有些线程先做完
 - 有些线程继续跑重任务
 - 最终出现尾部拖延（tail latency）
@@ -192,6 +202,7 @@
 **在 Lab 2 中的体现**
 
 动态分配方案，如：
+
 - `next_task_id_.fetch_add(1)`
 
 通常会比静态分块更适合这个测试。
@@ -199,7 +210,7 @@
 > **[RDMA 映射]**
 > 这和网络数据面里“不同流/不同 packet burst 的处理时长不一致”很像。静态分配会放大长尾，动态领取 work 更能压平 idle gap。
 
-- [ ] 学完后你应该能说出：`ping_pong_unequal` 的核心不是测 launch 开销，而是测负载均衡
+- 学完后你应该能说出：`ping_pong_unequal` 的核心不是测 launch 开销，而是测负载均衡
 
 ---
 
@@ -218,15 +229,18 @@
 **机制**
 
 参考定义：
+
 - [tests/README.md:17-18](../tests/README.md#L17-L18)
 - [tests.h:721-777](../tests/tests.h#L721-L777)
 
 特点：
+
 - `256 tasks`
 - `30 bulk launches`
 - `slowFn()` 是递归计算，计算量大
 
 这类测试里：
+
 - thread create/join 的固定开销相对不敏感
 - queue / atomic / CV 的开销相对被淹没
 - 更能体现“是否真正并行计算”
@@ -234,11 +248,11 @@
 **在 Lab 2 中的体现**
 
 如果你在这个测试也很差，往往说明不是“小优化问题”，而是：
+
 - worker 没吃满 CPU
 - 调度逻辑有严重问题
 - 正确性或同步路径限制了并行度
-
-- [ ] 学完后你应该能说出：重任务测试里，调度器不是完全不重要，但通常不是第一瓶颈
+- 学完后你应该能说出：重任务测试里，调度器不是完全不重要，但通常不是第一瓶颈
 
 ---
 
@@ -257,26 +271,29 @@
 **机制**
 
 参考定义：
+
 - [tests/README.md:20-21](../tests/README.md#L20-L21)
 - [tests.h:785-862](../tests/tests.h#L785-L862)
 
 特点：
+
 - `16 tasks per bulk launch`
 - `2000 bulk launches`
 - 每个 task 都有一定计算量，但不是极重
 
 这是一个典型的“thread pool 该比 spawn 更强”的场景：
+
 - launch 次数很多
 - 每次 launch 不够重，无法完全掩盖 create/join 成本
 
 **在 Lab 2 中的体现**
 
 如果你的 thread pool 在这个测试没有明显优于 spawn，优先怀疑：
+
 - `run()` 的批次发布成本太大
 - 主线程等待逻辑太重
 - worker 唤醒 / 获取任务路径不够精简
-
-- [ ] 学完后你应该能说出：这个测试既看计算，也很看“高频 launch 下的线程池复用是否值钱”
+- 学完后你应该能说出：这个测试既看计算，也很看“高频 launch 下的线程池复用是否值钱”
 
 ---
 
@@ -295,25 +312,30 @@
 **机制**
 
 参考定义：
+
 - [tests/README.md:23-24](../tests/README.md#L23-L24)
 - [tests.h:864-869](../tests/tests.h#L864-L869)
 
 这个测试相比前一个：
+
 - task 数更少
 - 每个 task 更重
 - launch 级固定成本相对被摊薄
 
 所以它能帮你判断：
+
 - 你的问题到底是任务过细导致的
 - 还是整体调度结构本身就不够高效
 
 **在 Lab 2 中的体现**
 
 如果某实现：
+
 - 在 `math_operations...` 慢
 - 在 `fewer_tasks` 变好很多
 
 往往说明主要问题在于：
+
 - 任务粒度太细时调度成本过高
 
 ---
@@ -333,14 +355,17 @@
 **机制**
 
 参考定义：
+
 - [tests/README.md:26-27](../tests/README.md#L26-L27)
 - [tests.h:878-953](../tests/tests.h#L878-L953)
 
 结构：
+
 - 先有很多 bulk launch，可并行启动
 - 最后一个 reduce launch 依赖所有前面的 launch
 
 这个测试对 Part B 特别关键，因为它验证：
+
 - 依赖计数是否正确
 - 所有前驱完成后才能解锁后继
 - `sync()` 是否真的等到了最后的 reduce 完成
@@ -348,6 +373,7 @@
 **在 Lab 2 中的体现**
 
 如果 async 版在这里出错，通常说明：
+
 - 依赖 bookkeeping 不完整
 - ready queue / waiting queue 语义没分清
 
@@ -368,15 +394,18 @@
 **机制**
 
 参考定义：
+
 - [tests/README.md:29-30](../tests/README.md#L29-L30)
 - [tests.h:961-1097](../tests/tests.h#L961-L1097)
 
 特点：
+
 - 初始层是很多 math bulk launches
 - 中间层不断做 2-to-1 reduce
 - 最终变成单个根节点结果
 
 它特别适合暴露：
+
 - 依赖传播延迟
 - 完成计数更新错误
 - DAG 状态转移 bug
@@ -405,15 +434,18 @@
 **机制**
 
 参考定义：
+
 - [tests/README.md:32-34](../tests/README.md#L32-L34)
 - [tests.h:1099-1171](../tests/tests.h#L1099-L1171)
 
 执行模式：
+
 1. 先一个极轻任务 launch
 2. 再一个只有 `2` 个 task 的中等任务 launch
 3. 再一个轻任务 launch
 
 问题在于：
+
 - 假设机器有很多 worker
 - 但中间那轮只有 2 个 task
 - 真正有用的线程只有极少数
@@ -422,14 +454,15 @@
 **在 Lab 2 中的体现**
 
 这个测试是 `ThreadPoolSleeping` 的主场，原因很直接：
+
 - sleeping 版能让没活线程睡下去
 - spinning 版天然会比较吃亏
 
 所以它不是在证明 spinning “错了”，而是在揭示：
+
 - spinning 的等待策略有明确代价
 - 某些 workload 下这种代价会非常明显
-
-- [ ] 学完后你应该能说出：这个测试主要不是测调度固定成本，而是测“空闲线程是否碍事”
+- 学完后你应该能说出：这个测试主要不是测调度固定成本，而是测“空闲线程是否碍事”
 
 ---
 
@@ -448,15 +481,18 @@
 **机制**
 
 参考定义：
+
 - [tests/README.md:35-36](../tests/README.md#L35-L36)
 - [tests.h:1180-1241](../tests/tests.h#L1180-L1241)
 
 特点：
+
 - 只有一次 launch
 - `128 tasks`
 - 每个 task 计算量大
 
 因此：
+
 - thread pool 的“复用”价值不明显
 - spawn 和 thread pool 的差距可能不会很大
 - 更看 worker 是否真正并行算图
@@ -464,6 +500,7 @@
 **在 Lab 2 中的体现**
 
 这个测试慢，优先怀疑：
+
 - 并行执行本身不够好
 - 分配策略或数据切分造成利用率不足
 - 不是先怀疑 launch 固定成本
@@ -474,16 +511,18 @@
 
 下面这张表是最实用的“反推表”。以后某个测试慢了，先照这个表定位。
 
-| 测试 | 优先怀疑什么 |
-|------|--------------|
-| `super_super_light` | `run()` 固定成本、thread create/join、per-task 调度路径太重 |
-| `super_light` | 调度尾部空转、主线程不参与工作、waiting 路径仍有额外成本 |
-| `ping_pong_equal` | 整体吞吐不足、主线程干扰 worker、共享状态争用 |
-| `ping_pong_unequal` | 静态分配、动态调度不够灵活、长尾明显 |
-| `recursive_fibonacci` | CPU 没吃满、真正并行度不够、同步逻辑限制执行 |
-| `math_operations...` | 高频 launch 下 thread pool 复用收益不明显、批次发布开销过高 |
-| `spin_between_run_calls` | spinning 空转影响有用线程、sleeping 语义不够正确 |
-| `mandelbrot_chunked` | 单次大任务并行执行效率低、不是 launch 固定成本问题 |
+
+| 测试                       | 优先怀疑什么                                          |
+| ------------------------ | ----------------------------------------------- |
+| `super_super_light`      | `run()` 固定成本、thread create/join、per-task 调度路径太重 |
+| `super_light`            | 调度尾部空转、主线程不参与工作、waiting 路径仍有额外成本                |
+| `ping_pong_equal`        | 整体吞吐不足、主线程干扰 worker、共享状态争用                      |
+| `ping_pong_unequal`      | 静态分配、动态调度不够灵活、长尾明显                              |
+| `recursive_fibonacci`    | CPU 没吃满、真正并行度不够、同步逻辑限制执行                        |
+| `math_operations...`     | 高频 launch 下 thread pool 复用收益不明显、批次发布开销过高        |
+| `spin_between_run_calls` | spinning 空转影响有用线程、sleeping 语义不够正确               |
+| `mandelbrot_chunked`     | 单次大任务并行执行效率低、不是 launch 固定成本问题                   |
+
 
 ---
 
@@ -492,16 +531,13 @@
 如果你现在主要做 Part A，我建议按下面顺序理解测试：
 
 1. **先看 `super_super_light`**
-   - 学会识别：调度器是否比任务本身还贵
-
+  - 学会识别：调度器是否比任务本身还贵
 2. **再看 `super_light`**
-   - 学会识别：正确实现和高效实现之间的差别
-
+  - 学会识别：正确实现和高效实现之间的差别
 3. **再看 `ping_pong_unequal`**
-   - 学会识别：动态分发的价值
-
+  - 学会识别：动态分发的价值
 4. **最后看 `spin_between_run_calls`**
-   - 学会理解：为什么 Sleeping 版不是“只是更复杂”，而是能解决 Spinning 的真实问题
+  - 学会理解：为什么 Sleeping 版不是“只是更复杂”，而是能解决 Spinning 的真实问题
 
 ---
 
@@ -511,28 +547,19 @@
 
 为什么一个在 `super_super_light` 上表现很好的 `ThreadPoolSpinning`，仍然可能在 `super_light` 上明显落后参考实现？
 
-<details>
-<summary>参考答案</summary>
-因为 `super_light` 已经进入“调度开销与计算开销同量级”的区域。方向对了不等于已经足够精炼，主线程不参与干活、尾部空转、共享状态访问路径过重等问题会在这里暴露出来。
-</details>
+参考答案 因为 `super_light` 已经进入“调度开销与计算开销同量级”的区域。方向对了不等于已经足够精炼，主线程不参与干活、尾部空转、共享状态访问路径过重等问题会在这里暴露出来。
 
 ### 思考题 2
 
 为什么 `ping_pong_unequal` 更能体现 `next_task_id.fetch_add(1)` 这种动态分发策略的价值？
 
-<details>
-<summary>参考答案</summary>
-因为不同 task 的工作量不一样，静态分块会导致某些线程先闲、某些线程拖尾，而动态领取任务能让空闲线程继续接手剩余工作，缩短尾部。
-</details>
+参考答案 因为不同 task 的工作量不一样，静态分块会导致某些线程先闲、某些线程拖尾，而动态领取任务能让空闲线程继续接手剩余工作，缩短尾部。
 
 ### 思考题 3
 
 为什么 `spin_between_run_calls` 对 Spinning 版不友好，却对 Sleeping 版很关键？
 
-<details>
-<summary>参考答案</summary>
-因为该测试故意让中间阶段只有少数线程有实际工作，其余线程如果一直 spinning，会与真正干活的线程竞争 CPU。Sleeping 版能让这些闲线程睡下去，从而减少干扰。
-</details>
+参考答案 因为该测试故意让中间阶段只有少数线程有实际工作，其余线程如果一直 spinning，会与真正干活的线程竞争 CPU。Sleeping 版能让这些闲线程睡下去，从而减少干扰。
 
 ---
 
@@ -567,13 +594,11 @@
 ## 六、建议你下一步怎么用这份文档
 
 1. 跑 `super_super_light` 和 `super_light`
-   - 不只看快慢，要先判断：问题是 launch 还是尾部空转
-
+  - 不只看快慢，要先判断：问题是 launch 还是尾部空转
 2. 跑 `ping_pong_unequal`
-   - 判断你的任务分发是不是已经足够动态
-
+  - 判断你的任务分发是不是已经足够动态
 3. 等你开始做 Sleeping，再重点盯 `spin_between_run_calls`
-   - 这是最能解释“为什么 sleeping 值得实现”的测试
+  - 这是最能解释“为什么 sleeping 值得实现”的测试
 
 ---
 
@@ -586,3 +611,4 @@
 - [theory_05_synchronization.md](theory_05_synchronization.md)
 - [theory_06_locality_contention.md](theory_06_locality_contention.md)
 - [experience_summary.md](experience_summary.md)
+

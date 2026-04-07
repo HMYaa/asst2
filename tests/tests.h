@@ -195,9 +195,12 @@ class PingPongTask : public IRunnable {
 
             if (equal_work_) {
                 for (int i=start_el; i<end_el; i++)
+                    // 只是构造一个“可控、稳定、确定”的工作负载函数，不追求算法意义。
                     output_array_[i] = ping_pong_work(iters_, input_array_[i]);
             } else {
                 for (int i=start_el; i<end_el; i++) {
+                    // i 小（靠前元素）-> el_iters 大（更重）
+                    // i 大（靠后元素）-> el_iters 小（更轻）
                     int el_iters = ping_pong_iters(i, num_elements_, iters_);
                     output_array_[i] = ping_pong_work(el_iters, input_array_[i]);
                 }
@@ -584,10 +587,14 @@ TestResults simpleTestAsync(ITaskSystem* t) {
  * `base_iters`, because each task gets `num_elements` / `num_tasks` elements
  * and does O(base_iters) work per element.
  */
+ // num_elements : 每次 bulk launch 处理的数据规模（输入/输出数组长度）。
+ // base_iters: 每个元素的“循环强度”基准（equal_work=true 时直接用它；unequal 时会按元素位置变成不同 iters）。
 TestResults pingPongTest(ITaskSystem* t, bool equal_work, bool do_async,
                          int num_elements, int base_iters) {
 
+    // 每个 bulk launch 有 64 个 task。
     int num_tasks = 64;
+    // 一共连续发起 400 个这样的 bulk launch。
     int num_bulk_task_launches = 400;   
 
     int* input = new int[num_elements];

@@ -1,9 +1,14 @@
 #include "tasksys.h"
 #include <atomic>
-#include <emmintrin.h> // 必须包含这个头文件以使用 _mm_pause()
 #include <condition_variable>
 #include <mutex>
 #include <iostream>
+
+// For CS149 we only need the x86 "pause" instruction used in spin-wait loops.
+// Using inline asm avoids clangd/x86 intrinsic header diagnostics on this setup.
+static inline void cs149_pause() {
+    __asm__ __volatile__("pause");
+}
 
 IRunnable::~IRunnable() {}
 
@@ -141,7 +146,7 @@ TaskSystemParallelThreadPoolSpinning::TaskSystemParallelThreadPoolSpinning(int n
                 }
 
                 if (!batch_active.load(std::memory_order_acquire)) {
-                    _mm_pause();
+                    cs149_pause();
                     continue;
                 }
                 
@@ -154,7 +159,7 @@ TaskSystemParallelThreadPoolSpinning::TaskSystemParallelThreadPoolSpinning(int n
                         batch_active.store(false, std::memory_order_release);
                     }
                 } else {
-                    _mm_pause();
+                    cs149_pause();
                 }
             }    
         });
@@ -200,7 +205,7 @@ void TaskSystemParallelThreadPoolSpinning::run(IRunnable* runnable, int num_tota
     batch_active.store(true, std::memory_order_release);
 
     while (batch_active.load(std::memory_order_acquire)) {
-        _mm_pause();
+        cs149_pause();
     }
 }
 

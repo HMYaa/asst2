@@ -2,6 +2,8 @@
 #define _TASKSYS_H
 
 #include "itasksys.h"
+#include <condition_variable>
+#include <mutex>
 #include <thread>
 #include <vector>
 #include <atomic>
@@ -89,6 +91,28 @@ class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
         TaskID runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
                                 const std::vector<TaskID>& deps);
         void sync();
+    private:
+        std::vector<std::thread> workers;
+        // std::queue<std::function<void()>> tasks;
+        IRunnable* current_runnable;
+
+        std::atomic<int>  next_task_id_;
+        int num_total_tasks_;
+        std::atomic<int>  remaining_tasks;
+        std::atomic<bool> batch_active;
+        std::atomic<bool> stop;
+        std::mutex mtx;
+        std::condition_variable cv_work;
+        std::condition_variable cv_done;
+
+        // int  next_task_id_;
+        // int num_total_tasks_;
+        // int  remaining_tasks;
+        // bool batch_active;
+        // bool stop;
+        // std::mutex mtx;
+        // std::condition_variable cv_work;
+        // std::condition_variable cv_done;
 };
 
 #endif

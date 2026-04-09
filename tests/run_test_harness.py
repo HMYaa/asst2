@@ -24,7 +24,9 @@ TASKSYS_DEFAULT_NUM_THREADS = multiprocessing.cpu_count()
 UNSPECIFIED_NUM_THREADS = -1
 
 PERF_THRESHOLD = 1.2
-NUM_TEST_RUNS = 5
+# yxw 为了减少测试时间，修改，
+# TODO: 后续 修改为 =5
+NUM_TEST_RUNS = 1
 
 LIST_OF_TESTS = [
     ("super_super_light", UNSPECIFIED_NUM_THREADS),

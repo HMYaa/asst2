@@ -1,4 +1,5 @@
 #include "tasksys.h"
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
@@ -266,45 +267,158 @@ num_total_tasks_(0),remaining_tasks(0),batch_active(false), stop(false), mtx(), 
     // Implementations are free to add new class member variables
     // (requiring changes to tasksys.h).
     //
-
-    for (size_t i = 0; i < num_threads; i ++) {
-        workers.emplace_back([this]{
-            while(true) {
-                IRunnable* runnable = nullptr;
-                int total = 0;
-                int task_id = -1;
-                    // 1) 锁内：等待 + 领任务
-                {
-                    std::unique_lock<std::mutex> lk(mtx);
+    // version1: 版本1
+    // for (size_t i = 0; i < num_threads; i ++) {
+    //     workers.emplace_back([this]{
+    //         while(true) {
+    //             IRunnable* runnable = nullptr;
+    //             int total = 0;
+    //             int task_id = -1;
+    //                 // 1) 锁内：等待 + 领任务
+    //             {
+    //                 std::unique_lock<std::mutex> lk(mtx);
         
-                    cv_work.wait(lk, [this]{ 
-                            return stop.load(std::memory_order_acquire) 
-                                || (batch_active.load(std::memory_order_acquire) 
-                                && next_task_id_.load(std::memory_order_acquire) < num_total_tasks_); });
+    //                 cv_work.wait(lk, [this]{ 
+    //                         return stop.load(std::memory_order_acquire) 
+    //                             || (batch_active.load(std::memory_order_acquire) 
+    //                             && next_task_id_.load(std::memory_order_acquire) < num_total_tasks_); });
                     
-                    if (stop.load(std::memory_order_acquire)) 
-                        break;
+    //                 if (stop.load(std::memory_order_acquire)) 
+    //                     break;
 
-                    task_id = next_task_id_.fetch_add(1, std::memory_order_relaxed);
-                    if (task_id >= num_total_tasks_) {
-                        continue;// 伪唤醒/被别人抢完，回去等
+    //                 task_id = next_task_id_.fetch_add(1, std::memory_order_relaxed);
+    //                 if (task_id >= num_total_tasks_) {
+    //                     continue;// 伪唤醒/被别人抢完，回去等
+    //                 }
+    //                 runnable = current_runnable;
+    //                 total = num_total_tasks_;
+    //             }// 这里自动解锁
+                
+    //             // 2) 锁外：执行任务
+    //             runnable->runTask(task_id, total);
+                
+    //             // 3) 锁内：更新计数 + 完成通知
+    //             {
+    //                 std::unique_lock<std::mutex> lk(mtx);
+    //                 int left = remaining_tasks.fetch_sub(1, std::memory_order_acq_rel) - 1;
+    //                 if (left == 0) {
+    //                     batch_active.store(false, std::memory_order_release);
+    //                     cv_done.notify_one();
+    //                 }
+    //             }
+    //         }
+    //     });
+    // }
+
+    // version2: 版本2
+    // for (size_t i = 0; i < num_threads; i ++) {
+    //     workers.emplace_back([this]{
+    //         while(true) {
+    //             IRunnable* runnable = nullptr;
+    //             int total = 0;
+    //             int task_id = -1;
+    //                 // 1) 锁内：等待 + 领任务
+    //             {
+    //                 std::unique_lock<std::mutex> lk(mtx);
+        
+    //                 cv_work.wait(lk, [this]{ 
+    //                         return stop.load(std::memory_order_acquire) 
+    //                             || (batch_active.load(std::memory_order_acquire) 
+    //                             && next_task_id_.load(std::memory_order_acquire) < num_total_tasks_); });
+                    
+    //                 if (stop.load(std::memory_order_acquire)) 
+    //                     break;
+
+    //                 task_id = next_task_id_.fetch_add(1, std::memory_order_relaxed);
+    //                 if (task_id >= num_total_tasks_) {
+    //                     continue;// 伪唤醒/被别人抢完，回去等
+    //                 }
+    //                 runnable = current_runnable;
+    //                 total = num_total_tasks_;
+    //             }// 这里自动解锁
+                
+    //             // 2) 锁外：执行任务
+    //             runnable->runTask(task_id, total);
+                
+    //             // 3) 锁内：更新计数 + 完成通知
+    //             {
+    //                 std::unique_lock<std::mutex> lk(mtx);
+    //                 int left = remaining_tasks.fetch_sub(1, std::memory_order_acq_rel) - 1;
+    //                 if (left == 0) {
+    //                     batch_active.store(false, std::memory_order_release);
+    //                     cv_done.notify_one();
+    //                 }
+    //             }
+    //         }
+    //     });
+    // }
+
+
+    // Worker 三阶段（与 run() 配合）：
+    //   A — 睡眠直到「新一批已发布」(batch_active) 或线程池关闭 (stop)。
+    //   B — 不持锁按 chunk fetch_add 抢一段下标再跑 runTask；减轻 next_task_id_ 争用（重负载用例敏感）。
+    //   C — 本批内可能「号已抢光但别人还在跑」；若直接回 A 且 batch_active 仍为 true，
+    //       则 wait 谓词恒真 → 忙等。故在 C 等到 !batch_active（本批收尾）再回 A。
+    for (int i = 0; i < num_threads; i++) {
+        workers.emplace_back([this, num_threads] {
+            std::unique_lock<std::mutex> lk(mtx);
+            while (true) {
+                // ---------- A：等下一批任务 ----------
+                // run() 在持锁下写好 runnable/计数并置 batch_active=true 后 notify_all(cv_work)。
+                cv_work.wait(lk, [this] {
+                    return stop.load(std::memory_order_acquire)
+                        || batch_active.load(std::memory_order_acquire);
+                });
+                if (stop.load(std::memory_order_acquire)) {
+                    break;
+                }
+
+                // B 段不持锁；与 run() 发布一批的临界区互斥由「仅 A/C 持 lk + B 很短」保证可见性。
+                lk.unlock();
+
+                // ---------- B：本批内按块抢号（chunk），再锁外执行 ----------
+                // 每任务 fetch_add(1) 在「任务多、每任务较重」的用例里会让 next_task_id_ 缓存行热点化，
+                // ping_pong_equal / math_* 会明显变慢；一次领 [start,lim) 可把全局原子次数约降为 1/chunk。
+                const int n = num_total_tasks_;
+                // 约按线程均分一批任务；过小则全局 fetch_add 仍频繁，过大则负载易不均（unequal 用例）。
+                int chunk = (n + num_threads - 1) / num_threads;
+                if (chunk < 1) {
+                    chunk = 1;
+                }
+                if (chunk > 32) {
+                    chunk = 32;
+                }
+
+                while (true) {
+                    const int start =
+                        next_task_id_.fetch_add(chunk, std::memory_order_relaxed);
+                    if (start >= n) {
+                        break;
                     }
-                    runnable = current_runnable;
-                    total = num_total_tasks_;
-                }// 这里自动解锁
-                
-                // 2) 锁外：执行任务
-                runnable->runTask(task_id, total);
-                
-                // 3) 锁内：更新计数 + 完成通知
-                {
-                    std::unique_lock<std::mutex> lk(mtx);
-                    int left = remaining_tasks.fetch_sub(1, std::memory_order_acq_rel) - 1;
-                    if (left == 0) {
-                        batch_active.store(false, std::memory_order_release);
-                        cv_done.notify_one();
+                    const int lim = std::min(start + chunk, n);
+                    for (int task_id = start; task_id < lim; ++task_id) {
+                        current_runnable->runTask(task_id, num_total_tasks_);
+                        if (remaining_tasks.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                            std::lock_guard<std::mutex> g(mtx);
+                            batch_active.store(false, std::memory_order_release);
+                            cv_done.notify_one();   // 唤醒 run() 所在线程
+                            // 唤醒所有睡在 C 的 worker，否则它们无法进入下一批的 A。
+                            cv_work.notify_all();
+                        }
                     }
                 }
+
+                // ---------- C：等本批真正结束（batch_active 被最后一个任务清 false）----------
+                // 早抢完号的线程在这里睡眠，避免在 batch_active==true 时回到 A 造成空转。
+                lk.lock();
+                cv_work.wait(lk, [this] {
+                    return stop.load(std::memory_order_acquire)
+                        || !batch_active.load(std::memory_order_acquire);
+                });
+                if (stop.load(std::memory_order_acquire)) {
+                    break;
+                }
+                // batch_active 已为 false；循环回到 A，阻塞直到 run() 发起下一批。
             }
         });
     }
@@ -341,13 +455,13 @@ void TaskSystemParallelThreadPoolSleeping::run(IRunnable* runnable, int num_tota
         num_total_tasks_ = num_total_tasks;
         next_task_id_.store(0, std::memory_order_release);
         remaining_tasks.store(num_total_tasks, std::memory_order_release);
-        batch_active.store(true, std::memory_order_release);
         if (num_total_tasks <= 0) {
             batch_active.store(false, std::memory_order_release);
             current_runnable = nullptr;
             num_total_tasks_ = 0;
             return;
         }
+        batch_active.store(true, std::memory_order_release);
     }
     cv_work.notify_all();
     {

@@ -1,5 +1,7 @@
 # CLAUDE.md
 
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 本文件为 Claude Code (claude.ai/code) 在此代码仓库中工作时提供指导。
 
 ## 仓库目的
@@ -190,6 +192,16 @@ clangd --check="/home/yangxw/yxw/cs149/asst2/part_a/tasksys.cpp" --compile-comma
 
 自然簿记单元通常是**批量 launch 记录**：runnable 指针、任务计数、剩余任务数、依赖计数器和后继列表。
 
+### 当前 Part B 实现关键结构（`part_b/tasksys.h`）
+
+- `BulkLaunch` 结构体（定义在 `tasksys.cpp`，`.h` 前向声明 + `unique_ptr`）：每次 `runAsyncWithDeps()` 一条记录，下标即 `TaskID`。
+- **两把锁分工**：
+  - `graph_mtx_`：保护依赖图（`launches_`、`successors_`、`ready_queue_`）+ `cv_work_` 通知 worker。
+  - `sync_mtx_`：仅供 `sync()` 在 `cv_sync_` 上等待 `outstanding_tasks_` 归零。
+- `outstanding_tasks_`：per-batch 粒度原子计数（而非 per-task），`sync()` 等其归零。
+- `ready_count_`：镜像 `ready_queue_.size()` 的原子整数，允许 worker 在不持 `graph_mtx_` 的情况下判断是否有可用工作，减少自旋时的惊群竞争。
+- `complete_bulk_launch_unlocked()`：假定调用方已持 `graph_mtx_`，传播依赖并可能触发 `cv_sync_` 通知。
+
 ## 行为变更前值得阅读的文件
 
 - `README.md` — 作业语义、评分期望和允许的假设。
@@ -197,6 +209,11 @@ clangd --check="/home/yangxw/yxw/cs149/asst2/part_a/tasksys.cpp" --compile-comma
 - `tests/main.cpp` — 确切的 CLI 可见测试名称和工具流程。
 - `part_a/tasksys.*` / `part_b/tasksys.*` — 实际的调度器实现。
 - `doc/theory_08_task_scheduler_lifecycle.md` — 任务生命周期、条件变量语义和 RDMA 映射（有助于理解调度器的状态机）。
+- `doc/design_part_b_dag_scheduler.md` — Part B DAG 调度器完整设计文档：BulkLaunch 一生的状态机、双锁设计原因、六条并发关键路径逐行分析。
+- `doc/design_task_scheduler_master.md` — Part A 调度器设计全景（Spinning vs Sleeping 权衡、线程池到条件变量的递进推导）。
+- `doc/part_b_scheduler_checklist_v1_v2.md` — 每次迭代/调试前的自检清单（V1 提交前并发正确性 7 条，V2 卡住/长尾/惊群诊断流程）。
+- `doc/experience_summary.md` / `doc/concurrency_design_experience_notes.md` — 已踩过的坑及修正认识（stop 语义、锁粒度、伪唤醒等）。
+- `doc/mastery_guide_part_b.md` — Part B 掌握度提升指南：从"读懂代码"到"能白板推导等效设计"的五级练习路径，含破坏性实验清单。
 
 ## 仓库特定工作风格
 

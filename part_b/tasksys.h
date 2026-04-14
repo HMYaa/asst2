@@ -101,9 +101,15 @@ class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
 
         std::vector<std::thread> workers_;
 
-        std::atomic<int> outstanding_tasks_;  // 全局未完成 runTask 数，sync 等待归零
+        std::atomic<int> outstanding_tasks_;  // 全局未完成 batch 数（per-batch[批次粒度]”，非 per-task[任务粒度]），sync 等待归零
         std::mutex sync_mtx_;
         std::condition_variable cv_sync_;
+
+        // ready_count_ 镜像 ready_queue_.size()，但可在不持锁时原子读取。
+        // 专为 worker 的无锁自旋阶段设计：worker 可以在不竞争 graph_mtx_ 的情况下
+        // 判断"有没有工作"，从而避免 16 个线程在自旋时同时轮流持锁造成的惊群竞争。
+        // 写操作（push/pop）始终在 graph_mtx_ 保护下进行，保证与 ready_queue_ 严格一致。
+        std::atomic<int> ready_count_{0};
 };
 
 #endif

@@ -61,6 +61,7 @@ unfinished_deps ← "我可以开始了吗？"   （依赖屏障，触发方向�
 
 - 0-task 无依赖 launch 的 `done` 是在哪里被设为 true 的？
 - 0-task 有依赖 launch 的 `done` 是在哪里被设为 true 的？
+    - 专门处理remaining=0 但 done=false 的情况，避免破坏DAG
 
 ### 模型 3：两把锁的职责分工来自一个死锁分析
 

@@ -138,7 +138,7 @@ void TaskSystemParallelThreadPoolSleeping::worker_loop() {
             std::this_thread::yield();
         }
         if (stop_.load(std::memory_order_acquire)) return;
-
+        // 等任务 + 取任务
         {
             std::unique_lock<std::mutex> lk(graph_mtx_);
             if (ready_queue_.empty()) {
@@ -151,14 +151,15 @@ void TaskSystemParallelThreadPoolSleeping::worker_loop() {
             ready_queue_.pop_front();
             ready_count_.fetch_sub(1, std::memory_order_relaxed);
         }
-
+        // 执行任务
         BulkLaunch& L = *launches_[static_cast<size_t>(lid)];
         const int n = L.num_tasks;
+        // 0-task batch 直接完成
         if (n == 0) {
             complete_bulk_launch(lid);
             continue;
         }
-
+        // N-task batch 抢号执行
         while (true) {
             const int start = L.next_task.fetch_add(1, std::memory_order_relaxed);
             if (start >= n) {
@@ -180,6 +181,8 @@ void TaskSystemParallelThreadPoolSleeping::run(IRunnable* runnable, int num_tota
 }
 
 // 注册 launch，建依赖边；若依赖满足则发布到 ready 队列。
+// 输入：runnable, num_total_tasks, deps
+// 输出：新 launch 的 TaskID
 TaskID TaskSystemParallelThreadPoolSleeping::runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
                                                               const std::vector<TaskID>& deps) {
     TaskID id = 0;
@@ -192,7 +195,7 @@ TaskID TaskSystemParallelThreadPoolSleeping::runAsyncWithDeps(IRunnable* runnabl
         launches_.emplace_back(new BulkLaunch(runnable, num_total_tasks, remaining_init));
         id = static_cast<TaskID>(launches_.size() - 1);
         successors_.resize(launches_.size());
-
+        // 建依赖边
         int unresolved = 0;
         for (TaskID d : deps) {
             assert(d < id);
@@ -206,10 +209,14 @@ TaskID TaskSystemParallelThreadPoolSleeping::runAsyncWithDeps(IRunnable* runnabl
         BulkLaunch* me = launches_[static_cast<size_t>(id)].get();
         me->unfinished_deps.store(unresolved, std::memory_order_release);
         outstanding_tasks_.fetch_add(1, std::memory_order_relaxed);
-
+        // 0-task batch 和 N-task batch 分别处理
+        // 提前梳理没有依赖的情况，避免在 worker 中重复判断
         if (num_total_tasks == 0) {
+            // 1. 0-task batch 并且**没有依赖**，直接完成
             if (unresolved == 0) complete_bulk_launch_unlocked(id);
+            // 2. 0-task batch 并且有依赖，等待依赖完成
         } else if (unresolved == 0) {
+            // 3. N-task batch 并且**没有依赖**，推到 ready_queue_，等待 worker 抢号执行
             const int copies = std::min(num_total_tasks, num_workers_);
             for (int i = 0; i < copies; ++i) {
                 ready_queue_.push_back(id);
@@ -217,6 +224,7 @@ TaskID TaskSystemParallelThreadPoolSleeping::runAsyncWithDeps(IRunnable* runnabl
             }
             schedule_now = (copies > 0);
         }
+        // 4.N-task batch 并且有依赖，等待依赖完成
     }
 
     if (schedule_now) cv_work_.notify_all();
